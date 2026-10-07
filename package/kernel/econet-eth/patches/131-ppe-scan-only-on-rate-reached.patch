@@ -1,0 +1,38 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: only bind/scan on HIT_UNBIND_RATE_REACHED (fix CPU saturation)
+
+After egress was moved to hardware (crsn 0x16 gone, bound flows bypass the
+CPU) throughput was still ~3 Mbit with the CPU pinned at 0% idle / 33% sirq.
+Cause: the RX commit path runs a full 16384-entry FOE table scan to find the
+engine's learned slot, and it ran for every UN_HIT/HIT_UNBIND packet of every
+not-yet-bound flow (~200/s), each scan reading the whole table uncached under
+spin_lock_irqsave - ~0.7s of CPU per second, collapsing throughput.
+
+The engine emits HIT_UNBIND_RATE_REACHED (0x0f) precisely when a flow is hot
+enough to bind, and at that moment its UNBIND entry was just hit so it is
+guaranteed present - the scan finds it on the first try and the flow binds once,
+then stays COMMITTED and is forwarded in hardware. Trigger the commit only on
+0x0f; leave 0x0d/0x0e on the normal slow path. This drops the scan rate from
+per-packet to roughly once per hot flow.
+
+diff -ruN b130/econet_qdma.c b131/econet_qdma.c
+--- a/econet_qdma.c	2026-06-29 22:28:50.170190374 +0300
++++ b/econet_qdma.c	2026-06-29 22:29:03.233506231 +0300
+@@ -224,10 +224,13 @@
+ 	}
+ 
+ 	switch (get_erx_crsn(&desc.msg.erx)) {
+-	case 0x0d:	/* UN_HIT: under FORWARD the hardware reports the real
+-			 * hash slot on a miss; publish any staged entry. */
+-	case 0x0e:	/* HIT_UNBIND */
+-	case 0x0f:	/* HIT_UNBIND_RATE_REACHED */
++	case 0x0f:	/* HIT_UNBIND_RATE_REACHED: the engine just hit an UNBIND
++			 * entry often enough to ask us to bind it. Only act here:
++			 * the UNBIND entry is guaranteed present (it was just hit)
++			 * so the table scan finds it first try, and this fires
++			 * roughly once per hot flow instead of on every miss -
++			 * the per-packet scan was saturating the CPU. Plain
++			 * UN_HIT/HIT_UNBIND (0x0d/0x0e) are left on the slow path. */
+ 		en75_ppe_offload_rx_commit(en75_eth_ppe(q->qdma->eth), skb, hash);
+ 		break;
+ 	case 0x16: {	/* HIT_BIND_FORCE_CPU: a bound entry was hit. Log once

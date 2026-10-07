@@ -1,0 +1,47 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: restore FORWARD_BUILD search-miss (mainline), revert 120
+
+Patch 120 switched SEARCH_MISS from FORWARD_BUILD(3) to FORWARD(2) because
+FORWARD_BUILD appeared to auto-learn "ipv6-6rd/ipv4-dslite garbage". That was
+a big-endian display artifact: the hardware had written valid little-endian
+IPv4-HNAPT entries that the BE CPU mis-decoded (now fixed by the FOE
+little-endian patch).
+
+With the byteswap fixed, driver-built BIND entries are stored correctly
+(state=BIND, sane ib1) yet the engine still returns UN_HIT under plain
+FORWARD: SEARCH_MISS only changes miss behaviour, not the table search, so a
+valid entry should hit in either mode -- unless it is written at the wrong
+slot. Under FORWARD the hash reported in the RX descriptor is not guaranteed
+to be the slot the engine actually searches (hash-collision resolution), so
+the entry lands on a slot the engine never probes. FORWARD_BUILD (what
+mainline mtk_ppe uses) makes the hardware itself choose, populate and report
+the slot, so committing the driver entry at that slot guarantees the engine
+finds it. Restore FORWARD_BUILD.
+
+diff -ruN b125/econet_ppe.c b126/econet_ppe.c
+--- a/econet_ppe.c	2026-06-29 00:48:39.960778721 +0300
++++ b/econet_ppe.c	2026-06-29 00:48:39.992777406 +0300
+@@ -366,13 +366,18 @@
+ 	      EN75_PPE_TB_CFG_AGE_TCP |
+ 	      EN75_PPE_TB_CFG_AGE_UDP |
+ 	      EN75_PPE_TB_CFG_AGE_TCP_FIN |
+-	      /* FORWARD: on a search miss the engine punts to CPU (UN_HIT)
+-	       * with the real hash slot in the descriptor. Driver-built entries
+-	       * are committed there via en75_ppe_offload_rx_commit(). No
+-	       * hardware auto-learn (FORWARD_BUILD self-populates garbage).
++	      /* FORWARD_BUILD (mainline mtk_ppe): on a search miss the engine
++	       * auto-learns an UNBIND entry at its real hash slot and reports
++	       * that slot in the descriptor. Committing the driver-built entry
++	       * at that exact slot guarantees "where we write" == "where the
++	       * engine searches" (incl. hash-collision resolution). Plain
++	       * FORWARD reports a hash that need not be the search slot -> a
++	       * valid BIND entry then never hits. (The "FORWARD_BUILD learns
++	       * 6rd/dslite garbage" symptom was a big-endian display artifact
++	       * of correct little-endian entries; fixed in the FOE LE patch.)
+ 	       */
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_SEARCH_MISS,
+-			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD) |
++			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD_BUILD) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_KEEPALIVE,
+ 			 EN75_PPE_KEEPALIVE_DISABLE) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_HASH_MODE, 1) |

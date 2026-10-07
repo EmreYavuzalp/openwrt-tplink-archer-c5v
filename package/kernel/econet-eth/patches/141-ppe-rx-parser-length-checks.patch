@@ -1,0 +1,47 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: restore RX tuple parser length checks
+
+The stale offload diagnostics patch carried useful skb bounds checks in the RX
+tuple parser. Once that patch is removed from the stack, keep those checks in a
+small standalone patch so malformed or short VLAN/IP/IPv6 frames cannot drive
+out-of-bounds tuple reads while the PPE bind path is being debugged.
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -148,6 +148,8 @@
+ 		return;
+ 	proto = ((const struct ethhdr *)data)->h_proto;
+ 	while (proto == htons(ETH_P_8021Q) || proto == htons(ETH_P_8021AD)) {
++		if (skb->len < l2 + VLAN_HLEN)
++			return;
+ 		proto = *(const __be16 *)(data + l2 + 2);
+ 		l2 += VLAN_HLEN;
+ 	}
+@@ -175,11 +177,17 @@
+ 	if (proto == htons(ETH_P_IP)) {
+ 		const struct iphdr *iph = (const struct iphdr *)(data + l2);
+ 		const __be16 *ports;
++		unsigned int ihl;
+ 
++		if (skb->len < l2 + sizeof(*iph))
++			return;
++		ihl = iph->ihl * 4;
++		if (ihl < sizeof(*iph) || skb->len < l2 + ihl + 4)
++			return;
+ 		if (iph->protocol != IPPROTO_TCP &&
+ 		    iph->protocol != IPPROTO_UDP)
+ 			return;
+-		ports = (const __be16 *)((const u8 *)iph + iph->ihl * 4);
++		ports = (const __be16 *)((const u8 *)iph + ihl);
+ 		t->l4proto = iph->protocol;
+ 		t->src[0] = iph->saddr;
+ 		t->dst[0] = iph->daddr;
+@@ -190,6 +198,8 @@
+ 			(const struct ipv6hdr *)(data + l2);
+ 		const __be16 *ports = (const __be16 *)(ip6 + 1);
+ 
++		if (skb->len < l2 + sizeof(*ip6) + 4)
++			return;
+ 		if (ip6->nexthdr != IPPROTO_TCP &&
+ 		    ip6->nexthdr != IPPROTO_UDP)
+ 			return;

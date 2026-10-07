@@ -1,0 +1,1886 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: add the PPE/FOE hardware-offload driver files (stage 1)
+
+Recovered from the en7528 development build. These are the standalone PPE
+(Packet Processing Engine) / FOE (Flow Offload Engine) sources for the
+EN751221-class MTK PPE "V1": engine bring-up, FOE table tuple builders and
+the nf_flowtable offload glue. They are not yet wired into Kbuild or the
+RX/probe paths (stage 2) and econet_foe.c still needs the big-endian tuple
+byte-swap for the EN751221 (stage 3). Kept in disabled/ until integrated.
+--- /dev/null
++++ b/econet_ppe.h
+@@ -0,0 +1,208 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Packet Processing Engine (PPE) for the EcoNet EN751221.
++ *
++ * The EN751221 PPE is register- and FOE-entry-compatible with the MediaTek
++ * "netsys v1" PPE (mt7621 class): 80-byte FOE entries, 16384 entries, and the
++ * same register block laid out at offset 0x200 within the PPE window that
++ * econet_eth.c maps as en751221_regs.ppe (0xBFB50C00). The accessors and
++ * register definitions below mirror the mainline mtk_ppe driver but are kept
++ * native to this driver to avoid pulling in the struct mtk_eth coupling.
++ *
++ * Milestone 1: bring the engine up against an empty FOE table. With no bound
++ * entries and the GDM forwarding left untouched, no packet is ever steered to
++ * the PPE, so the datapath is unchanged; this only validates register access,
++ * FOE table allocation and engine enable.
++ */
++#ifndef ECONET_PPE_H
++#define ECONET_PPE_H
++
++#include <linux/bitfield.h>
++#include <linux/rhashtable.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++
++struct device;
++struct dentry;
++
++/* 1024 << 4 = 16384 entries, matching the vendor gPpeFoeNum. */
++#define EN75_PPE_ENTRIES_SHIFT		4
++#define EN75_PPE_ENTRIES		(1024 << EN75_PPE_ENTRIES_SHIFT)
++
++/* Register offsets, relative to the start of the ppe[] window. */
++#define EN75_PPE_GLO_CFG		0x200
++#define EN75_PPE_GLO_CFG_EN			BIT(0)
++#define EN75_PPE_GLO_CFG_IP4_L4_CS_DROP		BIT(2)
++#define EN75_PPE_GLO_CFG_IP4_CS_DROP		BIT(3)
++#define EN75_PPE_GLO_CFG_FLOW_DROP_UPDATE	BIT(9)
++#define EN75_PPE_GLO_CFG_BUSY			BIT(31)
++
++#define EN75_PPE_FLOW_CFG		0x204
++#define EN75_PPE_FLOW_CFG_IP4_TCP_FRAG		BIT(6)
++#define EN75_PPE_FLOW_CFG_IP4_UDP_FRAG		BIT(7)
++#define EN75_PPE_FLOW_CFG_IP6_3T_ROUTE		BIT(8)
++#define EN75_PPE_FLOW_CFG_IP6_5T_ROUTE		BIT(9)
++#define EN75_PPE_FLOW_CFG_IP6_6RD		BIT(10)
++#define EN75_PPE_FLOW_CFG_IP4_NAT		BIT(12)
++#define EN75_PPE_FLOW_CFG_IP4_NAPT		BIT(13)
++#define EN75_PPE_FLOW_CFG_IP4_DSLITE		BIT(14)
++#define EN75_PPE_FLOW_CFG_IP4_NAT_FRAG		BIT(17)
++
++#define EN75_PPE_IP_PROTO_CHK		0x208
++#define EN75_PPE_IP_PROTO_CHK_IPV4		GENMASK(15, 0)
++#define EN75_PPE_IP_PROTO_CHK_IPV6		GENMASK(31, 16)
++
++#define EN75_PPE_TB_CFG			0x21c
++#define EN75_PPE_TB_CFG_ENTRY_NUM		GENMASK(2, 0)
++#define EN75_PPE_TB_CFG_ENTRY_80B		BIT(3)
++#define EN75_PPE_TB_CFG_SEARCH_MISS		GENMASK(5, 4)
++#define EN75_PPE_TB_CFG_AGE_NON_L4		BIT(7)
++#define EN75_PPE_TB_CFG_AGE_UNBIND		BIT(8)
++#define EN75_PPE_TB_CFG_AGE_TCP			BIT(9)
++#define EN75_PPE_TB_CFG_AGE_UDP			BIT(10)
++#define EN75_PPE_TB_CFG_AGE_TCP_FIN		BIT(11)
++#define EN75_PPE_TB_CFG_KEEPALIVE		GENMASK(13, 12)
++#define EN75_PPE_TB_CFG_HASH_MODE		GENMASK(15, 14)
++#define EN75_PPE_TB_CFG_SCAN_MODE		GENMASK(17, 16)
++
++/* Field values (see mainline mtk_ppe_regs.h enums). */
++#define EN75_PPE_SCAN_MODE_CHECK_AGE		1
++#define EN75_PPE_KEEPALIVE_DISABLE		0
++#define EN75_PPE_SEARCH_MISS_ACTION_FORWARD_BUILD	3
++#define EN75_PPE_SEARCH_MISS_ACTION_FORWARD	2
++
++#define EN75_PPE_TB_USED		0x224
++
++#define EN75_PPE_TB_BASE		0x220
++
++#define EN75_PPE_BIND_RATE		0x228
++#define EN75_PPE_BIND_RATE_BIND			GENMASK(15, 0)
++#define EN75_PPE_BIND_RATE_PREBIND		GENMASK(31, 16)
++
++#define EN75_PPE_BIND_LIMIT0		0x22c
++#define EN75_PPE_BIND_LIMIT0_QUARTER		GENMASK(13, 0)
++#define EN75_PPE_BIND_LIMIT0_HALF		GENMASK(29, 16)
++
++#define EN75_PPE_BIND_LIMIT1		0x230
++#define EN75_PPE_BIND_LIMIT1_FULL		GENMASK(13, 0)
++#define EN75_PPE_BIND_LIMIT1_NON_L4		GENMASK(23, 16)
++
++#define EN75_PPE_KEEPALIVE		0x234
++
++#define EN75_PPE_UNBIND_AGE		0x238
++#define EN75_PPE_UNBIND_AGE_MIN_PACKETS		GENMASK(31, 16)
++#define EN75_PPE_UNBIND_AGE_DELTA		GENMASK(7, 0)
++
++#define EN75_PPE_BIND_AGE0		0x23c
++#define EN75_PPE_BIND_AGE0_DELTA_NON_L4		GENMASK(30, 16)
++#define EN75_PPE_BIND_AGE0_DELTA_UDP		GENMASK(14, 0)
++
++#define EN75_PPE_BIND_AGE1		0x240
++#define EN75_PPE_BIND_AGE1_DELTA_TCP_FIN	GENMASK(30, 16)
++#define EN75_PPE_BIND_AGE1_DELTA_TCP		GENMASK(14, 0)
++
++#define EN75_PPE_DEFAULT_CPU_PORT	0x248
++
++#define EN75_PPE_CACHE_CTL		0x320
++#define EN75_PPE_CACHE_CTL_EN			BIT(0)
++#define EN75_PPE_CACHE_CTL_CLEAR			BIT(9)
++
++/* Frame-engine free-running timestamp (FE+0x10), drives FOE aging. */
++#define EN75_FE_FOE_TS			0x10
++
++/* PSE port numbers used as the FOE egress (ib2 DEST_PORT). */
++#define EN75_PPE_PSE_CPU_PORT		0
++#define EN75_PPE_PSE_GDM1_PORT		1
++#define EN75_PPE_PSE_GDM2_PORT		2
++
++#include "econet_foe.h"
++
++/** Per-PPE runtime state. */
++struct flow_cls_offload;
++
++struct en75_ppe {
++	struct device		*dev;
++	void __iomem		*base;
++	/* frame-engine timestamp register window, for FOE aging stamps. */
++	void __iomem		*fe;
++	struct en75_foe_entry	*foe;
++	dma_addr_t		foe_phys;
++	struct dentry		*debugfs;
++	/* hash slot of the debug test-bind entry, or ~0u if none. */
++	u32			test_hash;
++	/* cookie -> en75_flow_entry map for offloaded flows. */
++	struct rhashtable	flow_table;
++	bool			flow_table_ready;
++	/* devices offering indirect (bridge/VLAN) flow blocks. */
++	struct list_head	indr_block_list;
++	/* serialises FOE table/cache writes between process and RX softirq. */
++	spinlock_t		foe_lock;
++	/* tuple -> en75_flow_entry map, drives the RX-hint commit. */
++	struct rhashtable	tuple_table;
++	bool			tuple_table_ready;
++};
++
++/**
++ * en75_ppe_init() - allocate the FOE table and the PPE state.
++ * @dev:  device used for the coherent DMA allocation (devm managed).
++ * @base: ioremapped base of the ppe[] register window.
++ * @fe:   ioremapped base of the frame-engine register window (for timestamps).
++ *
++ * Returns the PPE state on success or an ERR_PTR() on failure. The engine is
++ * not started here; call en75_ppe_start() afterwards.
++ */
++struct en75_ppe *en75_ppe_init(struct device *dev, void __iomem *base,
++			       void __iomem *fe);
++
++/** en75_ppe_start() - program the registers and enable the engine. */
++void en75_ppe_start(struct en75_ppe *ppe);
++
++/** en75_ppe_stop() - disable the engine (safe to call before module unload). */
++void en75_ppe_stop(struct en75_ppe *ppe);
++
++/**
++ * en75_ppe_foe_commit() - publish a built FOE entry into the live table.
++ * @hash:  table index from en75_foe_entry_hash().
++ * @entry: fully built entry; its ib1 (state/static/timestamp) must be final.
++ *
++ * Writes the entry body before the information block so the engine never
++ * observes a half-written BIND entry, then flushes the FOE cache.
++ */
++void en75_ppe_foe_commit(struct en75_ppe *ppe, u32 hash,
++			 struct en75_foe_entry *entry);
++
++/** en75_ppe_foe_clear() - invalidate the live FOE entry at @hash. */
++void en75_ppe_foe_clear(struct en75_ppe *ppe, u32 hash);
++
++/*
++ * No-lock variants: the caller must hold ppe->foe_lock. Used by the offload
++ * code so the FOE write and the owning flow-entry state change are atomic
++ * against a concurrent RX-hint commit or teardown.
++ */
++void __en75_ppe_foe_commit(struct en75_ppe *ppe, u32 hash,
++			   struct en75_foe_entry *entry);
++void __en75_ppe_foe_clear(struct en75_ppe *ppe, u32 hash);
++
++/** en75_ppe_timestamp() - current frame-engine timestamp (BIND_TIMESTAMP bits). */
++u16 en75_ppe_timestamp(struct en75_ppe *ppe);
++
++/* nf_flowtable / TC flower offload (econet_ppe_offload.c). */
++int en75_ppe_offload_init(struct en75_ppe *ppe);
++void en75_ppe_offload_deinit(struct en75_ppe *ppe);
++int en75_ppe_offload_cmd(struct en75_ppe *ppe, struct flow_cls_offload *cls);
++
++/**
++ * en75_ppe_offload_rx_commit() - bind a pending offloaded flow using the slot
++ * the hardware reported for a missed packet.
++ * @skb:     the received packet (UN_HIT); its ingress 5-tuple is the key.
++ * @hw_slot: the FOE slot the engine computed, from the RX descriptor.
++ *
++ * Called from the RX softirq. If a flow with this tuple was staged by a TC/
++ * flowtable REPLACE but not yet committed, its prebuilt entry is published at
++ * @hw_slot - the exact slot the engine will search - so subsequent packets hit.
++ */
++struct sk_buff;
++void en75_ppe_offload_rx_commit(struct en75_ppe *ppe, struct sk_buff *skb,
++				u32 hw_slot);
++
++#endif /* ECONET_PPE_H */
+--- /dev/null
++++ b/econet_ppe.c
+@@ -0,0 +1,366 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Packet Processing Engine (PPE) bring-up for the EcoNet EN751221.
++ *
++ * See econet_ppe.h for the relationship to the mainline MediaTek PPE. This
++ * file implements milestone 1 only: allocate the FOE table and enable the
++ * engine with no bound flows. Flow binding (nf_flowtable offload) is added in
++ * a later change.
++ */
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/kernel.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/if_ether.h>
++#include <linux/in.h>
++
++#include "econet_ppe.h"
++
++#define EN75_PPE_WAIT_TIMEOUT_US	1000000
++
++static inline u32 ppe_r32(struct en75_ppe *ppe, u32 reg)
++{
++	return readl(ppe->base + reg);
++}
++
++static inline void ppe_w32(struct en75_ppe *ppe, u32 reg, u32 val)
++{
++	writel(val, ppe->base + reg);
++}
++
++static int ppe_wait_busy(struct en75_ppe *ppe)
++{
++	u32 val;
++	int ret;
++
++	ret = readl_poll_timeout(ppe->base + EN75_PPE_GLO_CFG, val,
++				 !(val & EN75_PPE_GLO_CFG_BUSY),
++				 20, EN75_PPE_WAIT_TIMEOUT_US);
++	if (ret)
++		dev_err(ppe->dev, "PPE table busy\n");
++
++	return ret;
++}
++
++static void en75_ppe_cache_clear(struct en75_ppe *ppe)
++{
++	u32 v = ppe_r32(ppe, EN75_PPE_CACHE_CTL);
++
++	ppe_w32(ppe, EN75_PPE_CACHE_CTL, v | EN75_PPE_CACHE_CTL_CLEAR);
++	ppe_w32(ppe, EN75_PPE_CACHE_CTL, v & ~EN75_PPE_CACHE_CTL_CLEAR);
++}
++
++void __en75_ppe_foe_commit(struct en75_ppe *ppe, u32 hash,
++			   struct en75_foe_entry *entry)
++{
++	struct en75_foe_entry *hwe = &ppe->foe[hash];
++
++	/* Body before ib1: the engine must never see a BIND-state entry with a
++	 * half-written tuple or rewrite header.
++	 */
++	memcpy(hwe->data, entry->data, sizeof(hwe->data));
++	wmb();
++	hwe->ib1 = entry->ib1;
++	dma_wmb();
++	en75_ppe_cache_clear(ppe);
++}
++
++void __en75_ppe_foe_clear(struct en75_ppe *ppe, u32 hash)
++{
++	ppe->foe[hash].ib1 &= ~EN75_FOE_IB1_STATE;
++	dma_wmb();
++	en75_ppe_cache_clear(ppe);
++}
++
++void en75_ppe_foe_commit(struct en75_ppe *ppe, u32 hash,
++			 struct en75_foe_entry *entry)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ppe->foe_lock, flags);
++	__en75_ppe_foe_commit(ppe, hash, entry);
++	spin_unlock_irqrestore(&ppe->foe_lock, flags);
++}
++
++void en75_ppe_foe_clear(struct en75_ppe *ppe, u32 hash)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ppe->foe_lock, flags);
++	__en75_ppe_foe_clear(ppe, hash);
++	spin_unlock_irqrestore(&ppe->foe_lock, flags);
++}
++
++u16 en75_ppe_timestamp(struct en75_ppe *ppe)
++{
++	return readl(ppe->fe + EN75_FE_FOE_TS) & EN75_FOE_IB1_BIND_TIMESTAMP;
++}
++
++static const char *foe_state_name(u32 s)
++{
++	static const char * const n[] = { "invalid", "unbind", "bind", "fin" };
++
++	return n[s & 0x3];
++}
++
++static const char *foe_pkt_type_name(u32 t)
++{
++	switch (t) {
++	case EN75_PPE_PKT_TYPE_IPV4_HNAPT:	return "ipv4-hnapt";
++	case EN75_PPE_PKT_TYPE_IPV4_ROUTE:	return "ipv4-route";
++	case EN75_PPE_PKT_TYPE_BRIDGE:		return "bridge";
++	case EN75_PPE_PKT_TYPE_IPV4_DSLITE:	return "ipv4-dslite";
++	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T:	return "ipv6-route-3t";
++	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T:	return "ipv6-route-5t";
++	case EN75_PPE_PKT_TYPE_IPV6_6RD:	return "ipv6-6rd";
++	default:				return "?";
++	}
++}
++
++static int en75_ppe_foe_show(struct seq_file *m, void *v)
++{
++	struct en75_ppe *ppe = m->private;
++	unsigned int counts[4] = { 0 };
++	unsigned int i, shown = 0;
++
++	for (i = 0; i < EN75_PPE_ENTRIES; i++) {
++		u32 ib1 = READ_ONCE(ppe->foe[i].ib1);
++
++		counts[FIELD_GET(EN75_FOE_IB1_STATE, ib1)]++;
++	}
++
++	seq_printf(m, "FOE table @ %pad, %u entries\n",
++		   &ppe->foe_phys, EN75_PPE_ENTRIES);
++	seq_printf(m, "states: invalid=%u unbind=%u bind=%u fin=%u\n",
++		   counts[EN75_FOE_STATE_INVALID], counts[EN75_FOE_STATE_UNBIND],
++		   counts[EN75_FOE_STATE_BIND], counts[EN75_FOE_STATE_FIN]);
++
++	for (i = 0; i < EN75_PPE_ENTRIES; i++) {
++		u32 ib1 = READ_ONCE(ppe->foe[i].ib1);
++		u32 state = FIELD_GET(EN75_FOE_IB1_STATE, ib1);
++		u32 type = FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1);
++
++		if (state == EN75_FOE_STATE_INVALID)
++			continue;
++		if (shown++ >= 64) {
++			seq_puts(m, "... (truncated)\n");
++			break;
++		}
++		seq_printf(m, "  [%5u] %-6s %-13s ib1=%08x", i,
++			   foe_state_name(state), foe_pkt_type_name(type), ib1);
++		if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT ||
++		    type == EN75_PPE_PKT_TYPE_IPV4_ROUTE) {
++			struct en75_foe_ipv4 *e = &ppe->foe[i].ipv4;
++
++			seq_printf(m, " orig sip=%08x dip=%08x ports=%08x",
++				   e->orig.src_ip, e->orig.dest_ip, e->orig.ports);
++		}
++		seq_putc(m, '\n');
++	}
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(en75_ppe_foe);
++
++/*
++ * Debug facility: bind one synthetic, STATIC IPv4 HNAPT entry whose egress
++ * PSE port is the CPU. The tuple uses RFC5737 TEST-NET addresses so it can
++ * never match real traffic; the entry exists only to prove the commit path
++ * (table write, hash, cache flush, persistence) end to end. A matching packet
++ * would surface as crsn HIT_BIND_FORCE_CPU(0x16) without leaving the CPU path,
++ * so there is no forwarding risk. `echo 1` binds, `echo 0` invalidates.
++ */
++static ssize_t en75_ppe_test_bind_write(struct file *file,
++					const char __user *ubuf,
++					size_t len, loff_t *off)
++{
++	static const u8 smac[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x01 };
++	static const u8 dmac[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x02 };
++	struct en75_ppe *ppe = file->private_data;
++	struct en75_foe_entry e;
++	char buf[4] = {};
++	u32 hash;
++
++	if (copy_from_user(buf, ubuf, min(len, sizeof(buf) - 1)))
++		return -EFAULT;
++
++	if (buf[0] == '0') {
++		if (ppe->test_hash != ~0u) {
++			ppe->foe[ppe->test_hash].ib1 &= ~EN75_FOE_IB1_STATE;
++			dma_wmb();
++			en75_ppe_cache_clear(ppe);
++			ppe->test_hash = ~0u;
++		}
++		return len;
++	}
++
++	/* QDMA0_CPU (PSE port 0) keeps the bound packet on the CPU path. */
++	en75_foe_entry_prepare(&e, EN75_PPE_PKT_TYPE_IPV4_HNAPT, IPPROTO_TCP,
++			       0, smac, dmac);
++	en75_foe_entry_set_ipv4_tuple(&e, false,
++				      cpu_to_be32(0xc0000201), cpu_to_be16(1234),
++				      cpu_to_be32(0xc0000202), cpu_to_be16(5678));
++	en75_foe_entry_set_ipv4_tuple(&e, true,
++				      cpu_to_be32(0xc6336401), cpu_to_be16(1234),
++				      cpu_to_be32(0xc0000202), cpu_to_be16(5678));
++	e.ib1 |= EN75_FOE_IB1_STATIC;
++
++	hash = en75_foe_entry_hash(&e);
++	en75_ppe_foe_commit(ppe, hash, &e);
++	ppe->test_hash = hash;
++
++	dev_info(ppe->dev, "test_bind: static HNAPT entry committed at hash %u\n",
++		 hash);
++	return len;
++}
++
++static const struct file_operations en75_ppe_test_bind_fops = {
++	.open	= simple_open,
++	.write	= en75_ppe_test_bind_write,
++	.llseek	= default_llseek,
++};
++
++struct en75_ppe *en75_ppe_init(struct device *dev, void __iomem *base,
++			       void __iomem *fe)
++{
++	struct en75_ppe *ppe;
++
++	ppe = devm_kzalloc(dev, sizeof(*ppe), GFP_KERNEL);
++	if (!ppe)
++		return ERR_PTR(-ENOMEM);
++
++	ppe->dev = dev;
++	ppe->base = base;
++	ppe->fe = fe;
++
++	ppe->foe = dmam_alloc_coherent(dev,
++				       EN75_PPE_ENTRIES * sizeof(*ppe->foe),
++				       &ppe->foe_phys, GFP_KERNEL);
++	if (!ppe->foe)
++		return ERR_PTR(-ENOMEM);
++
++	ppe->test_hash = ~0u;
++	spin_lock_init(&ppe->foe_lock);
++	ppe->debugfs = debugfs_create_dir("econet_ppe", NULL);
++	debugfs_create_file("foe", 0444, ppe->debugfs, ppe,
++			    &en75_ppe_foe_fops);
++	debugfs_create_file("test_bind", 0200, ppe->debugfs, ppe,
++			    &en75_ppe_test_bind_fops);
++
++	if (en75_ppe_offload_init(ppe))
++		dev_warn(dev, "flow offload table init failed\n");
++
++	return ppe;
++}
++
++void en75_ppe_start(struct en75_ppe *ppe)
++{
++	u32 val;
++
++	if (IS_ERR_OR_NULL(ppe))
++		return;
++
++	/* Point the engine at the (zeroed) FOE table. */
++	ppe_w32(ppe, EN75_PPE_TB_BASE, ppe->foe_phys);
++
++	val = EN75_PPE_TB_CFG_AGE_NON_L4 |
++	      EN75_PPE_TB_CFG_AGE_UNBIND |
++	      EN75_PPE_TB_CFG_AGE_TCP |
++	      EN75_PPE_TB_CFG_AGE_UDP |
++	      EN75_PPE_TB_CFG_AGE_TCP_FIN |
++	      /* FORWARD_BUILD: the engine learns each flow at its real hash
++	       * slot (reported via crsn HIT_UNBIND/RATE_REACHED) - the only
++	       * slot it actually searches. The plain-FORWARD miss slot is not
++	       * on that set. (Auto-bind garbage is the cost; addressed next.)
++	       */
++	      FIELD_PREP(EN75_PPE_TB_CFG_SEARCH_MISS,
++			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD_BUILD) |
++	      FIELD_PREP(EN75_PPE_TB_CFG_KEEPALIVE,
++			 EN75_PPE_KEEPALIVE_DISABLE) |
++	      FIELD_PREP(EN75_PPE_TB_CFG_HASH_MODE, 1) |
++	      FIELD_PREP(EN75_PPE_TB_CFG_SCAN_MODE,
++			 EN75_PPE_SCAN_MODE_CHECK_AGE) |
++	      FIELD_PREP(EN75_PPE_TB_CFG_ENTRY_NUM, EN75_PPE_ENTRIES_SHIFT) |
++	      EN75_PPE_TB_CFG_ENTRY_80B;
++	ppe_w32(ppe, EN75_PPE_TB_CFG, val);
++
++	ppe_w32(ppe, EN75_PPE_IP_PROTO_CHK,
++		EN75_PPE_IP_PROTO_CHK_IPV4 | EN75_PPE_IP_PROTO_CHK_IPV6);
++
++	/* Enable the FOE cache; the table is freshly zeroed so nothing is
++	 * stale to flush.
++	 */
++	ppe_w32(ppe, EN75_PPE_CACHE_CTL, EN75_PPE_CACHE_CTL_EN);
++
++	val = EN75_PPE_FLOW_CFG_IP6_3T_ROUTE |
++	      EN75_PPE_FLOW_CFG_IP6_5T_ROUTE |
++	      EN75_PPE_FLOW_CFG_IP6_6RD |
++	      EN75_PPE_FLOW_CFG_IP4_NAT |
++	      EN75_PPE_FLOW_CFG_IP4_NAPT |
++	      EN75_PPE_FLOW_CFG_IP4_DSLITE |
++	      EN75_PPE_FLOW_CFG_IP4_NAT_FRAG |
++	      EN75_PPE_FLOW_CFG_IP4_TCP_FRAG |
++	      EN75_PPE_FLOW_CFG_IP4_UDP_FRAG;
++	ppe_w32(ppe, EN75_PPE_FLOW_CFG, val);
++
++	val = FIELD_PREP(EN75_PPE_UNBIND_AGE_MIN_PACKETS, 1000) |
++	      FIELD_PREP(EN75_PPE_UNBIND_AGE_DELTA, 3);
++	ppe_w32(ppe, EN75_PPE_UNBIND_AGE, val);
++
++	val = FIELD_PREP(EN75_PPE_BIND_AGE0_DELTA_UDP, 12) |
++	      FIELD_PREP(EN75_PPE_BIND_AGE0_DELTA_NON_L4, 1);
++	ppe_w32(ppe, EN75_PPE_BIND_AGE0, val);
++
++	val = FIELD_PREP(EN75_PPE_BIND_AGE1_DELTA_TCP_FIN, 1) |
++	      FIELD_PREP(EN75_PPE_BIND_AGE1_DELTA_TCP, 7);
++	ppe_w32(ppe, EN75_PPE_BIND_AGE1, val);
++
++	val = EN75_PPE_BIND_LIMIT0_QUARTER | EN75_PPE_BIND_LIMIT0_HALF;
++	ppe_w32(ppe, EN75_PPE_BIND_LIMIT0, val);
++
++	val = EN75_PPE_BIND_LIMIT1_FULL |
++	      FIELD_PREP(EN75_PPE_BIND_LIMIT1_NON_L4, 1);
++	ppe_w32(ppe, EN75_PPE_BIND_LIMIT1, val);
++
++	val = FIELD_PREP(EN75_PPE_BIND_RATE_BIND, 30) |
++	      FIELD_PREP(EN75_PPE_BIND_RATE_PREBIND, 1);
++	ppe_w32(ppe, EN75_PPE_BIND_RATE, val);
++
++	val = EN75_PPE_GLO_CFG_EN |
++	      EN75_PPE_GLO_CFG_IP4_L4_CS_DROP |
++	      EN75_PPE_GLO_CFG_IP4_CS_DROP |
++	      EN75_PPE_GLO_CFG_FLOW_DROP_UPDATE;
++	ppe_w32(ppe, EN75_PPE_GLO_CFG, val);
++
++	/* Default CPU port for punted (unbound / miss) traffic. */
++	ppe_w32(ppe, EN75_PPE_DEFAULT_CPU_PORT, 0);
++
++	ppe_wait_busy(ppe);
++
++	dev_info(ppe->dev,
++		 "PPE enabled: %u FOE entries @ %pad, GLO_CFG=%#x TB_CFG=%#x\n",
++		 EN75_PPE_ENTRIES, &ppe->foe_phys,
++		 ppe_r32(ppe, EN75_PPE_GLO_CFG),
++		 ppe_r32(ppe, EN75_PPE_TB_CFG));
++}
++
++void en75_ppe_stop(struct en75_ppe *ppe)
++{
++	if (IS_ERR_OR_NULL(ppe))
++		return;
++
++	en75_ppe_offload_deinit(ppe);
++
++	debugfs_remove_recursive(ppe->debugfs);
++	ppe->debugfs = NULL;
++
++	ppe_w32(ppe, EN75_PPE_CACHE_CTL, 0);
++	ppe_w32(ppe, EN75_PPE_GLO_CFG, 0);
++	ppe_wait_busy(ppe);
++}
+--- /dev/null
++++ b/econet_foe.h
+@@ -0,0 +1,190 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Hardware FOE (Flow Offload Engine) table entry layout for the EcoNet
++ * EN751221 PPE.
++ *
++ * The entry is the MediaTek "netsys v1" 80-byte format (mt7621 class),
++ * confirmed against the vendor hw_nat.ko (FoeDumpEntry walks 20 words) and
++ * mainline mtk_ppe.h. The field layout below mirrors mainline so the entry
++ * construction helpers can be ported with matching offsets. Unlike mainline
++ * the mac_info here carries only the v1 fields (20 bytes); that is what makes
++ * the IPv6 5-tuple variant come out to exactly 80 bytes.
++ *
++ * This header only defines the table format; it is not yet wired into the
++ * datapath.
++ */
++#ifndef ECONET_FOE_H
++#define ECONET_FOE_H
++
++#include <linux/bits.h>
++#include <linux/if_ether.h>
++#include <linux/types.h>
++
++/* Information block 1 (entry word 0). */
++#define EN75_FOE_IB1_UNBIND_TIMESTAMP	GENMASK(7, 0)
++#define EN75_FOE_IB1_UNBIND_PACKETS	GENMASK(23, 8)
++#define EN75_FOE_IB1_UNBIND_PREBIND	BIT(24)
++
++#define EN75_FOE_IB1_BIND_TIMESTAMP	GENMASK(14, 0)
++#define EN75_FOE_IB1_BIND_KEEPALIVE	BIT(15)
++#define EN75_FOE_IB1_BIND_VLAN_LAYER	GENMASK(18, 16)
++#define EN75_FOE_IB1_BIND_PPPOE		BIT(19)
++#define EN75_FOE_IB1_BIND_VLAN_TAG	BIT(20)
++#define EN75_FOE_IB1_BIND_PKT_SAMPLE	BIT(21)
++#define EN75_FOE_IB1_BIND_CACHE		BIT(22)
++#define EN75_FOE_IB1_BIND_TUNNEL_DECAP	BIT(23)
++#define EN75_FOE_IB1_BIND_TTL		BIT(24)
++
++#define EN75_FOE_IB1_PACKET_TYPE	GENMASK(27, 25)
++#define EN75_FOE_IB1_STATE		GENMASK(29, 28)
++#define EN75_FOE_IB1_UDP		BIT(30)
++#define EN75_FOE_IB1_STATIC		BIT(31)
++
++enum {
++	EN75_FOE_STATE_INVALID,
++	EN75_FOE_STATE_UNBIND,
++	EN75_FOE_STATE_BIND,
++	EN75_FOE_STATE_FIN,
++};
++
++enum {
++	EN75_PPE_PKT_TYPE_IPV4_HNAPT		= 0,
++	EN75_PPE_PKT_TYPE_IPV4_ROUTE		= 1,
++	EN75_PPE_PKT_TYPE_BRIDGE		= 2,
++	EN75_PPE_PKT_TYPE_IPV4_DSLITE		= 3,
++	EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T		= 4,
++	EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T		= 5,
++	EN75_PPE_PKT_TYPE_IPV6_6RD		= 7,
++};
++
++/* Two FOE entries share a hash bucket (vendor gPpeHashMode / mtk hash_offset). */
++#define EN75_PPE_HASH_OFFSET		2
++
++/* Information block 2. */
++#define EN75_FOE_IB2_QID		GENMASK(3, 0)
++#define EN75_FOE_IB2_PSE_QOS		BIT(4)
++#define EN75_FOE_IB2_DEST_PORT		GENMASK(7, 5)
++#define EN75_FOE_IB2_MULTICAST		BIT(8)
++#define EN75_FOE_IB2_WDMA_QID2		GENMASK(13, 12)
++#define EN75_FOE_IB2_WDMA_DEVIDX	BIT(16)
++#define EN75_FOE_IB2_WDMA_WINFO		BIT(17)
++#define EN75_FOE_IB2_PORT_MG		GENMASK(17, 12)
++#define EN75_FOE_IB2_PORT_AG		GENMASK(23, 18)
++#define EN75_FOE_IB2_DSCP		GENMASK(31, 24)
++
++/* Shared L2 trailer: rewritten MAC/VLAN/PPPoE header for the bound flow. */
++struct en75_foe_mac_info {
++	u16 vlan1;
++	u16 etype;
++
++	u32 dest_mac_hi;
++
++	u16 vlan2;
++	u16 dest_mac_lo;
++
++	u32 src_mac_hi;
++
++	u16 pppoe_id;
++	u16 src_mac_lo;
++};
++
++_Static_assert(sizeof(struct en75_foe_mac_info) == 20,
++	       "v1 FOE mac_info must be 20 bytes");
++
++struct en75_ipv4_tuple {
++	u32 src_ip;
++	u32 dest_ip;
++	union {
++		struct {
++			u16 dest_port;
++			u16 src_port;
++		};
++		struct {
++			u8 protocol;
++			u8 _pad[3]; /* fill with 0xa5a5a5 */
++		};
++		u32 ports;
++	};
++};
++
++/* L2 bridge offload entry. */
++struct en75_foe_bridge {
++	u8 dest_mac[ETH_ALEN];
++	u8 src_mac[ETH_ALEN];
++	u16 vlan;
++
++	u32 ib2;
++
++	struct en75_foe_mac_info l2;
++};
++
++/* IPv4 NAT / NAPT entry. */
++struct en75_foe_ipv4 {
++	struct en75_ipv4_tuple orig;
++
++	u32 ib2;
++
++	struct en75_ipv4_tuple new;
++
++	u16 timestamp;
++	u16 _rsv0[3];
++
++	u32 udf_tsid;
++
++	struct en75_foe_mac_info l2;
++};
++
++/* IPv6 3-tuple / 5-tuple route entry. */
++struct en75_foe_ipv6 {
++	u32 src_ip[4];
++	u32 dest_ip[4];
++
++	union {
++		struct {
++			u8 protocol;
++			u8 _pad[3]; /* fill with 0xa5a5a5 */
++		}; /* 3-tuple */
++		struct {
++			u16 dest_port;
++			u16 src_port;
++		}; /* 5-tuple */
++		u32 ports;
++	};
++
++	u32 _rsv[3];
++
++	u32 udf;
++
++	u32 ib2;
++	struct en75_foe_mac_info l2;
++};
++
++/* One 80-byte hardware FOE table entry. */
++struct en75_foe_entry {
++	u32 ib1;
++	union {
++		struct en75_foe_bridge	bridge;
++		struct en75_foe_ipv4	ipv4;
++		struct en75_foe_ipv6	ipv6;
++		u32			data[19];
++	};
++};
++
++_Static_assert(sizeof(struct en75_foe_entry) == 80,
++	       "FOE entry must be 80 bytes (MTK v1 layout)");
++
++/* FOE table-entry construction (econet_foe.c). Pure host-memory helpers. */
++int en75_foe_entry_prepare(struct en75_foe_entry *entry, int type, int l4proto,
++			   u8 pse_port, const u8 *src_mac, const u8 *dest_mac);
++int en75_foe_entry_set_pse_port(struct en75_foe_entry *entry, u8 port);
++int en75_foe_entry_set_ipv4_tuple(struct en75_foe_entry *entry, bool egress,
++				  __be32 src_addr, __be16 src_port,
++				  __be32 dest_addr, __be16 dest_port);
++int en75_foe_entry_set_ipv6_tuple(struct en75_foe_entry *entry,
++				  __be32 *src_addr, __be16 src_port,
++				  __be32 *dest_addr, __be16 dest_port);
++int en75_foe_entry_set_vlan(struct en75_foe_entry *entry, int vid);
++int en75_foe_entry_set_pppoe(struct en75_foe_entry *entry, int sid);
++u32 en75_foe_entry_hash(struct en75_foe_entry *entry);
++
++#endif /* ECONET_FOE_H */
+--- /dev/null
++++ b/econet_foe.c
+@@ -0,0 +1,319 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * FOE (Flow Offload Engine) table-entry construction for the EcoNet EN751221
++ * PPE.
++ *
++ * These helpers build a single 80-byte MediaTek "netsys v1" FOE entry in host
++ * memory: the L3 tuple, the rewritten L2 header (MAC/VLAN/PPPoE) and the
++ * information blocks that tell the engine how to forward a bound flow. They
++ * mirror the mainline mtk_ppe entry builders (the v1 path only) so the field
++ * encodings match the hardware the vendor hw_nat.ko drives.
++ *
++ * Everything here is pure: it only touches the caller's struct en75_foe_entry
++ * and never the hardware. Committing a finished entry into the live FOE table
++ * (timestamp, cache flush, table write) is done elsewhere.
++ */
++#include <linux/bitfield.h>
++#include <linux/swab.h>
++#include <linux/bitops.h>
++#include <linux/etherdevice.h>
++#include <linux/if_ether.h>
++#include <linux/in.h>
++#include <linux/kernel.h>
++#include <linux/unaligned.h>
++
++#include "econet_ppe.h"
++
++static int en75_get_ib1_pkt_type(u32 ib1)
++{
++	return FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1);
++}
++
++/*
++ * The rewritten L2 header lives at a type-dependent offset: the bridge entry
++ * carries it inline, the IPv6/dslite/6rd entries share the larger ipv6 body,
++ * and the IPv4 NAT/route entries use the ipv4 body.
++ */
++static struct en75_foe_mac_info *en75_foe_entry_l2(struct en75_foe_entry *entry)
++{
++	int type = en75_get_ib1_pkt_type(entry->ib1);
++
++	if (type == EN75_PPE_PKT_TYPE_BRIDGE)
++		return &entry->bridge.l2;
++
++	if (type >= EN75_PPE_PKT_TYPE_IPV4_DSLITE)
++		return &entry->ipv6.l2;
++
++	return &entry->ipv4.l2;
++}
++
++static u32 *en75_foe_entry_ib2(struct en75_foe_entry *entry)
++{
++	int type = en75_get_ib1_pkt_type(entry->ib1);
++
++	if (type == EN75_PPE_PKT_TYPE_BRIDGE)
++		return &entry->bridge.ib2;
++
++	if (type >= EN75_PPE_PKT_TYPE_IPV4_DSLITE)
++		return &entry->ipv6.ib2;
++
++	return &entry->ipv4.ib2;
++}
++
++/**
++ * en75_foe_entry_prepare() - initialise a FOE entry for a flow.
++ * @entry:    entry to fill (fully overwritten).
++ * @type:     EN75_PPE_PKT_TYPE_* of the flow.
++ * @l4proto:  IP L4 protocol (selects the UDP information bit).
++ * @pse_port: PSE egress port the bound flow is forwarded to (etx_fport).
++ * @src_mac:  rewritten source MAC (the router's egress MAC).
++ * @dest_mac: rewritten destination MAC (the next hop).
++ *
++ * Sets the entry to the BIND state with the L2 rewrite header and the
++ * information blocks. The L3 tuple is filled in afterwards with the
++ * en75_foe_entry_set_*_tuple() helpers.
++ */
++int en75_foe_entry_prepare(struct en75_foe_entry *entry, int type, int l4proto,
++			   u8 pse_port, const u8 *src_mac, const u8 *dest_mac)
++{
++	struct en75_foe_mac_info *l2;
++	u32 ports_pad, val;
++
++	memset(entry, 0, sizeof(*entry));
++
++	entry->ib1 = FIELD_PREP(EN75_FOE_IB1_STATE, EN75_FOE_STATE_BIND) |
++		     FIELD_PREP(EN75_FOE_IB1_PACKET_TYPE, type) |
++		     FIELD_PREP(EN75_FOE_IB1_UDP, l4proto == IPPROTO_UDP) |
++		     EN75_FOE_IB1_BIND_CACHE | EN75_FOE_IB1_BIND_TTL;
++
++	val = FIELD_PREP(EN75_FOE_IB2_DEST_PORT, pse_port) |
++	      FIELD_PREP(EN75_FOE_IB2_PORT_MG, 0x3f) |
++	      FIELD_PREP(EN75_FOE_IB2_PORT_AG, 0x1f);
++
++	if (is_multicast_ether_addr(dest_mac))
++		val |= EN75_FOE_IB2_MULTICAST;
++
++	/* Route entries keep no L4 ports; the field is poisoned like the
++	 * vendor entry so a partial match never aliases a real port pair.
++	 */
++	ports_pad = 0xa5a5a500 | (l4proto & 0xff);
++	if (type == EN75_PPE_PKT_TYPE_IPV4_ROUTE)
++		entry->ipv4.orig.ports = ports_pad;
++	if (type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T)
++		entry->ipv6.ports = ports_pad;
++
++	if (type == EN75_PPE_PKT_TYPE_BRIDGE) {
++		ether_addr_copy(entry->bridge.src_mac, src_mac);
++		ether_addr_copy(entry->bridge.dest_mac, dest_mac);
++		entry->bridge.ib2 = val;
++		l2 = &entry->bridge.l2;
++	} else if (type >= EN75_PPE_PKT_TYPE_IPV4_DSLITE) {
++		entry->ipv6.ib2 = val;
++		l2 = &entry->ipv6.l2;
++	} else {
++		entry->ipv4.ib2 = val;
++		l2 = &entry->ipv4.l2;
++	}
++
++	l2->dest_mac_hi = get_unaligned_be32(dest_mac);
++	l2->dest_mac_lo = get_unaligned_be16(dest_mac + 4);
++	l2->src_mac_hi = get_unaligned_be32(src_mac);
++	l2->src_mac_lo = get_unaligned_be16(src_mac + 4);
++
++	if (type >= EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T)
++		l2->etype = ETH_P_IPV6;
++	else
++		l2->etype = ETH_P_IP;
++
++	return 0;
++}
++
++/**
++ * en75_foe_entry_set_pse_port() - override the egress PSE port.
++ *
++ * Updates only the DEST_PORT field of ib2, leaving the rest of the entry as
++ * prepared. Used when the egress port is decided after en75_foe_entry_prepare().
++ */
++int en75_foe_entry_set_pse_port(struct en75_foe_entry *entry, u8 port)
++{
++	u32 *ib2 = en75_foe_entry_ib2(entry);
++
++	*ib2 &= ~EN75_FOE_IB2_DEST_PORT;
++	*ib2 |= FIELD_PREP(EN75_FOE_IB2_DEST_PORT, port);
++
++	return 0;
++}
++
++/**
++ * en75_foe_entry_set_ipv4_tuple() - set one side of an IPv4 flow's L3 tuple.
++ * @egress: false for the original (match) tuple, true for the NAT'd (rewrite)
++ *          tuple. The rewrite tuple only exists for HNAPT entries.
++ *
++ * Addresses and ports are passed in network byte order and stored in host
++ * order, as the hardware expects. Route entries store only the addresses.
++ */
++int en75_foe_entry_set_ipv4_tuple(struct en75_foe_entry *entry, bool egress,
++				  __be32 src_addr, __be16 src_port,
++				  __be32 dest_addr, __be16 dest_port)
++{
++	int type = en75_get_ib1_pkt_type(entry->ib1);
++	struct en75_ipv4_tuple *t;
++
++	switch (type) {
++	case EN75_PPE_PKT_TYPE_IPV4_HNAPT:
++		if (egress) {
++			t = &entry->ipv4.new;
++			break;
++		}
++		fallthrough;
++	case EN75_PPE_PKT_TYPE_IPV4_DSLITE:
++	case EN75_PPE_PKT_TYPE_IPV4_ROUTE:
++		t = &entry->ipv4.orig;
++		break;
++	default:
++		WARN_ON_ONCE(1);
++		return -EINVAL;
++	}
++
++	/* The FOE table is little-endian but this SoC is big-endian, so the
++	 * engine reads each tuple word byte-reversed from host order. Store
++	 * the swapped value so the hardware sees the correct address/ports.
++	 */
++	t->src_ip = swab32(be32_to_cpu(src_addr));
++	t->dest_ip = swab32(be32_to_cpu(dest_addr));
++
++	if (type == EN75_PPE_PKT_TYPE_IPV4_ROUTE)
++		return 0;
++
++	t->ports = swab32(((u32)be16_to_cpu(dest_port) << 16) |
++			  be16_to_cpu(src_port));
++
++	return 0;
++}
++
++/**
++ * en75_foe_entry_set_ipv6_tuple() - set an IPv6 route flow's L3 tuple.
++ *
++ * Handles the 3-tuple (addresses only) and 5-tuple (addresses + ports)
++ * route types. dslite/6rd tunnel entries are not yet supported.
++ */
++int en75_foe_entry_set_ipv6_tuple(struct en75_foe_entry *entry,
++				  __be32 *src_addr, __be16 src_port,
++				  __be32 *dest_addr, __be16 dest_port)
++{
++	int type = en75_get_ib1_pkt_type(entry->ib1);
++	int i;
++
++	switch (type) {
++	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T:
++		entry->ipv6.ports = swab32(((u32)be16_to_cpu(dest_port) << 16) |
++				   be16_to_cpu(src_port));
++		fallthrough;
++	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T:
++		break;
++	default:
++		WARN_ON_ONCE(1);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < 4; i++) {
++		entry->ipv6.src_ip[i] = swab32(be32_to_cpu(src_addr[i]));
++		entry->ipv6.dest_ip[i] = swab32(be32_to_cpu(dest_addr[i]));
++	}
++
++	return 0;
++}
++
++/**
++ * en75_foe_entry_set_vlan() - push a VLAN tag onto the rewritten L2 header.
++ *
++ * Up to two stacked tags are supported. The VLAN-layer count in ib1 tracks how
++ * many tags are present; the second tag reuses the etype-as-protocol slot of
++ * the first, matching the hardware's egress encoding.
++ */
++int en75_foe_entry_set_vlan(struct en75_foe_entry *entry, int vid)
++{
++	struct en75_foe_mac_info *l2 = en75_foe_entry_l2(entry);
++
++	switch (FIELD_GET(EN75_FOE_IB1_BIND_VLAN_LAYER, entry->ib1)) {
++	case 0:
++		entry->ib1 |= EN75_FOE_IB1_BIND_VLAN_TAG |
++			      FIELD_PREP(EN75_FOE_IB1_BIND_VLAN_LAYER, 1);
++		l2->vlan1 = vid;
++		return 0;
++	case 1:
++		if (!(entry->ib1 & EN75_FOE_IB1_BIND_VLAN_TAG)) {
++			l2->vlan1 = vid;
++			l2->etype |= BIT(8);
++		} else {
++			l2->vlan2 = vid;
++			entry->ib1 += FIELD_PREP(EN75_FOE_IB1_BIND_VLAN_LAYER, 1);
++		}
++		return 0;
++	default:
++		return -ENOSPC;
++	}
++}
++
++/**
++ * en75_foe_entry_set_pppoe() - mark the rewritten L2 header as PPPoE.
++ *
++ * Adds the PPPoE session id and flags the entry so the engine inserts a PPPoE
++ * session header on egress.
++ */
++int en75_foe_entry_set_pppoe(struct en75_foe_entry *entry, int sid)
++{
++	struct en75_foe_mac_info *l2 = en75_foe_entry_l2(entry);
++
++	if (!(entry->ib1 & EN75_FOE_IB1_BIND_VLAN_LAYER) ||
++	    (entry->ib1 & EN75_FOE_IB1_BIND_VLAN_TAG))
++		l2->etype = ETH_P_PPP_SES;
++
++	entry->ib1 |= EN75_FOE_IB1_BIND_PPPOE;
++	l2->pppoe_id = sid;
++
++	return 0;
++}
++
++/**
++ * en75_foe_entry_hash() - FOE table index for an entry.
++ *
++ * Reproduces the vendor/mainline v1 hash so a flow lands in the same bucket
++ * the engine searches for its packets. Only the original (ingress) tuple
++ * participates. With hash_offset 2 the low bit selects one of two slots that
++ * share a bucket.
++ */
++u32 en75_foe_entry_hash(struct en75_foe_entry *entry)
++{
++	u32 hv1, hv2, hv3, hash;
++
++	switch (en75_get_ib1_pkt_type(entry->ib1)) {
++	case EN75_PPE_PKT_TYPE_IPV4_ROUTE:
++	case EN75_PPE_PKT_TYPE_IPV4_HNAPT:
++		hv1 = entry->ipv4.orig.ports;
++		hv2 = entry->ipv4.orig.dest_ip;
++		hv3 = entry->ipv4.orig.src_ip;
++		break;
++	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T:
++	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T:
++		hv1 = entry->ipv6.src_ip[3] ^ entry->ipv6.dest_ip[3];
++		hv1 ^= entry->ipv6.ports;
++		hv2 = entry->ipv6.src_ip[2] ^ entry->ipv6.dest_ip[2];
++		hv2 ^= entry->ipv6.dest_ip[0];
++		hv3 = entry->ipv6.src_ip[1] ^ entry->ipv6.dest_ip[1];
++		hv3 ^= entry->ipv6.src_ip[0];
++		break;
++	default:
++		WARN_ON_ONCE(1);
++		return EN75_PPE_ENTRIES - 1;
++	}
++
++	hash = (hv1 & hv2) | ((~hv1) & hv3);
++	hash = (hash >> 24) | ((hash & 0xffffff) << 8);
++	hash ^= hv1 ^ hv2 ^ hv3;
++	hash ^= hash >> 16;
++	hash <<= ffs(EN75_PPE_HASH_OFFSET) - 1;
++	hash &= EN75_PPE_ENTRIES - 1;
++
++	return hash;
++}
+--- /dev/null
++++ b/econet_ppe_offload.c
+@@ -0,0 +1,779 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * nf_flowtable / TC flower offload glue for the EcoNet EN751221 PPE.
++ *
++ * Ported from the mainline mtk_ppe_offload.c (Felix Fietkau), trimmed to the
++ * netsys-v1 path this hardware implements: no WED, no DSA, no netsys-v2 fields.
++ * A flow offered by the kernel flowtable is translated into an 80-byte FOE
++ * entry with the econet_foe.c builders and committed into the live table.
++ *
++ * The EN751221 FOE lookup hash is a bespoke CRC the driver cannot yet
++ * reproduce, so a software-computed slot would never be searched by the
++ * engine. Instead the commit is deferred: REPLACE only stages the prebuilt
++ * entry (keyed by its ingress 5-tuple); when a real packet for that flow
++ * misses (UN_HIT) the RX path calls en75_ppe_offload_rx_commit() with the
++ * slot the hardware itself reported in the descriptor, and the entry is
++ * published there - exactly where the engine will look it up.
++ *
++ * Staged rollout (milestone 2b-3a): every bound flow's egress PSE port is
++ * forced to the CPU. A matching packet then surfaces as crsn
++ * HIT_BIND_FORCE_CPU(0x16) while still being forwarded by the CPU exactly as
++ * before, so the binding can be validated on hardware with no forwarding risk.
++ * Flipping EN75_PPE_FORCE_CPU to 0 (milestone 2b-3b) lets the hardware forward
++ * the rewritten packet to the real egress port instead.
++ */
++#include <linux/bitfield.h>
++#include <linux/err.h>
++#include <linux/etherdevice.h>
++#include <linux/if_ether.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/if_vlan.h>
++#include <linux/mutex.h>
++#include <linux/rhashtable.h>
++#include <linux/skbuff.h>
++#include <linux/slab.h>
++#include <net/flow_offload.h>
++#include <net/pkt_cls.h>
++
++#include "econet_ppe.h"
++
++struct en75_flow_data {
++	struct ethhdr eth;
++
++	union {
++		struct {
++			__be32 src_addr;
++			__be32 dst_addr;
++		} v4;
++
++		struct {
++			struct in6_addr src_addr;
++			struct in6_addr dst_addr;
++		} v6;
++	};
++
++	__be16 src_port;
++	__be16 dst_port;
++
++	u16 vlan_in;
++
++	struct {
++		struct {
++			u16 id;
++			__be16 proto;
++		} vlans[2];
++		u8 num;
++	} vlan;
++	struct {
++		u16 sid;
++		u8 num;
++	} pppoe;
++};
++
++/* Ingress 5-tuple key, in network byte order; fully zeroed before use so
++ * the trailing pad is deterministic for the rhashtable memcmp.
++ */
++struct en75_flow_tuple {
++	__be32 src[4];		/* v4 in [0] */
++	__be32 dst[4];
++	__be16 sport;
++	__be16 dport;
++	u8 is_v6;
++	u8 l4proto;
++	u8 pad[2];
++};
++
++enum en75_flow_state {
++	EN75_FLOW_PENDING = 0,	/* staged, awaiting the hardware slot */
++	EN75_FLOW_COMMITTED,	/* published at ->hash */
++	EN75_FLOW_DEAD,		/* torn down; awaiting RCU free */
++};
++
++struct en75_flow_entry {
++	struct rhash_head node;		/* keyed by cookie */
++	struct rhash_head tuple_node;	/* keyed by tuple */
++	struct rcu_head rcu;
++	unsigned long cookie;
++	struct en75_flow_tuple tuple;
++	struct en75_foe_entry foe;	/* prebuilt; committed lazily by RX */
++	u32 hash;			/* slot, valid once COMMITTED */
++	int state;
++};
++
++static const struct rhashtable_params en75_flow_ht_params = {
++	.head_offset = offsetof(struct en75_flow_entry, node),
++	.key_offset = offsetof(struct en75_flow_entry, cookie),
++	.key_len = sizeof(unsigned long),
++	.automatic_shrinking = true,
++};
++
++static const struct rhashtable_params en75_tuple_ht_params = {
++	.head_offset = offsetof(struct en75_flow_entry, tuple_node),
++	.key_offset = offsetof(struct en75_flow_entry, tuple),
++	.key_len = sizeof(struct en75_flow_tuple),
++	.automatic_shrinking = true,
++};
++
++static void
++en75_flow_tuple_from_data(struct en75_flow_tuple *t, u16 addr_type,
++			  u8 l4proto, const struct en75_flow_data *data)
++{
++	memset(t, 0, sizeof(*t));
++	t->l4proto = l4proto;
++	t->sport = data->src_port;
++	t->dport = data->dst_port;
++	if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
++		t->is_v6 = 1;
++		memcpy(t->src, &data->v6.src_addr, sizeof(t->src));
++		memcpy(t->dst, &data->v6.dst_addr, sizeof(t->dst));
++	} else {
++		t->src[0] = data->v4.src_addr;
++		t->dst[0] = data->v4.dst_addr;
++	}
++}
++
++/* Parse the ingress 5-tuple straight from a received frame (post-VLAN). */
++static void
++en75_flow_tuple_from_skb(struct en75_flow_tuple *t, struct sk_buff *skb)
++{
++	const u8 *data = skb->data;
++	unsigned int l2 = ETH_HLEN;
++	__be16 proto;
++
++	memset(t, 0, sizeof(*t));
++
++	if (skb->len < ETH_HLEN)
++		return;
++	proto = ((const struct ethhdr *)data)->h_proto;
++	while (proto == htons(ETH_P_8021Q) || proto == htons(ETH_P_8021AD)) {
++		proto = *(const __be16 *)(data + l2 + 2);
++		l2 += VLAN_HLEN;
++	}
++
++	if (proto == htons(ETH_P_IP)) {
++		const struct iphdr *iph = (const struct iphdr *)(data + l2);
++		const __be16 *ports;
++
++		if (iph->protocol != IPPROTO_TCP &&
++		    iph->protocol != IPPROTO_UDP)
++			return;
++		ports = (const __be16 *)((const u8 *)iph + iph->ihl * 4);
++		t->l4proto = iph->protocol;
++		t->src[0] = iph->saddr;
++		t->dst[0] = iph->daddr;
++		t->sport = ports[0];
++		t->dport = ports[1];
++	} else if (proto == htons(ETH_P_IPV6)) {
++		const struct ipv6hdr *ip6 =
++			(const struct ipv6hdr *)(data + l2);
++		const __be16 *ports = (const __be16 *)(ip6 + 1);
++
++		if (ip6->nexthdr != IPPROTO_TCP &&
++		    ip6->nexthdr != IPPROTO_UDP)
++			return;
++		t->is_v6 = 1;
++		t->l4proto = ip6->nexthdr;
++		memcpy(t->src, &ip6->saddr, sizeof(t->src));
++		memcpy(t->dst, &ip6->daddr, sizeof(t->dst));
++		t->sport = ports[0];
++		t->dport = ports[1];
++	}
++}
++
++static void
++en75_flow_offload_mangle_eth(const struct flow_action_entry *act, void *eth)
++{
++	void *dest = eth + act->mangle.offset;
++	const void *src = &act->mangle.val;
++
++	if (act->mangle.offset > 8)
++		return;
++
++	if (act->mangle.mask == 0xffff) {
++		src += 2;
++		dest += 2;
++	}
++
++	memcpy(dest, src, act->mangle.mask ? 2 : 4);
++}
++
++static int
++en75_flow_mangle_ports(const struct flow_action_entry *act,
++		       struct en75_flow_data *data)
++{
++	u32 val = ntohl(act->mangle.val);
++
++	switch (act->mangle.offset) {
++	case 0:
++		if (act->mangle.mask == ~htonl(0xffff))
++			data->dst_port = cpu_to_be16(val);
++		else
++			data->src_port = cpu_to_be16(val >> 16);
++		break;
++	case 2:
++		data->dst_port = cpu_to_be16(val);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int
++en75_flow_mangle_ipv4(const struct flow_action_entry *act,
++		      struct en75_flow_data *data)
++{
++	__be32 *dest;
++
++	switch (act->mangle.offset) {
++	case offsetof(struct iphdr, saddr):
++		dest = &data->v4.src_addr;
++		break;
++	case offsetof(struct iphdr, daddr):
++		dest = &data->v4.dst_addr;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	memcpy(dest, &act->mangle.val, sizeof(u32));
++
++	return 0;
++}
++
++static int
++en75_flow_set_ipv4_addr(struct en75_foe_entry *foe, struct en75_flow_data *data,
++			bool egress)
++{
++	return en75_foe_entry_set_ipv4_tuple(foe, egress,
++					     data->v4.src_addr, data->src_port,
++					     data->v4.dst_addr, data->dst_port);
++}
++
++static int
++en75_ppe_offload_replace(struct en75_ppe *ppe, struct flow_cls_offload *f)
++{
++	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
++	struct flow_action_entry *act;
++	struct en75_flow_data data = {};
++	struct en75_flow_entry *entry;
++	struct en75_foe_entry foe;
++	int offload_type = 0;
++	u16 addr_type = 0;
++	u8 l4proto = 0;
++	struct en75_flow_tuple keytuple;
++	int err = 0;
++	int i;
++
++	if (rhashtable_lookup(&ppe->flow_table, &f->cookie, en75_flow_ht_params))
++		return -EEXIST;
++
++	/* The flowtable always tags the rule with the ingress meta key. */
++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
++		return -EOPNOTSUPP;
++
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
++		struct flow_match_control match;
++
++		flow_rule_match_control(rule, &match);
++		addr_type = match.key->addr_type;
++
++		if (flow_rule_has_control_flags(match.mask->flags,
++						f->common.extack))
++			return -EOPNOTSUPP;
++	} else {
++		return -EOPNOTSUPP;
++	}
++
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
++		struct flow_match_basic match;
++
++		flow_rule_match_basic(rule, &match);
++		l4proto = match.key->ip_proto;
++	} else {
++		return -EOPNOTSUPP;
++	}
++
++	switch (addr_type) {
++	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
++		offload_type = EN75_PPE_PKT_TYPE_IPV4_HNAPT;
++		break;
++	case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
++		offload_type = EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	flow_action_for_each(i, act, &rule->action) {
++		switch (act->id) {
++		case FLOW_ACTION_MANGLE:
++			if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_ETH)
++				en75_flow_offload_mangle_eth(act, &data.eth);
++			break;
++		case FLOW_ACTION_REDIRECT:
++			/* odev: used to pick the egress port in 3b. */
++			break;
++		case FLOW_ACTION_CSUM:
++			break;
++		case FLOW_ACTION_VLAN_PUSH:
++			if (data.vlan.num + data.pppoe.num == 2 ||
++			    act->vlan.proto != htons(ETH_P_8021Q))
++				return -EOPNOTSUPP;
++
++			data.vlan.vlans[data.vlan.num].id = act->vlan.vid;
++			data.vlan.vlans[data.vlan.num].proto = act->vlan.proto;
++			data.vlan.num++;
++			break;
++		case FLOW_ACTION_VLAN_POP:
++			break;
++		case FLOW_ACTION_PPPOE_PUSH:
++			if (data.pppoe.num == 1 || data.vlan.num == 2)
++				return -EOPNOTSUPP;
++
++			data.pppoe.sid = act->pppoe.sid;
++			data.pppoe.num++;
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++	}
++
++	if (!is_valid_ether_addr(data.eth.h_source) ||
++	    !is_valid_ether_addr(data.eth.h_dest))
++		return -EINVAL;
++
++	/* Milestone 2b-3a forces the egress to the CPU: the entry is fully
++	 * built (incl. the L2 rewrite from the eth mangle actions) but the
++	 * packet stays on the CPU path, so a hit is observable (crsn
++	 * HIT_BIND_FORCE_CPU) with no forwarding risk. 3b resolves the
++	 * REDIRECT odev to a GDM port and uses it here instead.
++	 */
++	err = en75_foe_entry_prepare(&foe, offload_type, l4proto,
++				     EN75_PPE_PSE_CPU_PORT,
++				     data.eth.h_source, data.eth.h_dest);
++	if (err)
++		return err;
++
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
++		struct flow_match_ports ports;
++
++		flow_rule_match_ports(rule, &ports);
++		data.src_port = ports.key->src;
++		data.dst_port = ports.key->dst;
++	} else {
++		return -EOPNOTSUPP;
++	}
++
++	if (addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
++		struct flow_match_ipv4_addrs addrs;
++
++		flow_rule_match_ipv4_addrs(rule, &addrs);
++		data.v4.src_addr = addrs.key->src;
++		data.v4.dst_addr = addrs.key->dst;
++
++		en75_flow_set_ipv4_addr(&foe, &data, false);
++	}
++
++	if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
++		struct flow_match_ipv6_addrs addrs;
++
++		flow_rule_match_ipv6_addrs(rule, &addrs);
++		data.v6.src_addr = addrs.key->src;
++		data.v6.dst_addr = addrs.key->dst;
++
++		en75_foe_entry_set_ipv6_tuple(&foe,
++					      data.v6.src_addr.s6_addr32,
++					      data.src_port,
++					      data.v6.dst_addr.s6_addr32,
++					      data.dst_port);
++	}
++
++	/* Snapshot the ingress tuple now: the second action pass rewrites
++	 * data.*_port / data.v4 in place with the egress (post-NAT) values.
++	 * This key is what the RX-hint commit matches incoming packets on.
++	 */
++	en75_flow_tuple_from_data(&keytuple, addr_type, l4proto, &data);
++
++	flow_action_for_each(i, act, &rule->action) {
++		if (act->id != FLOW_ACTION_MANGLE)
++			continue;
++
++		switch (act->mangle.htype) {
++		case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
++		case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
++			err = en75_flow_mangle_ports(act, &data);
++			break;
++		case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
++			err = en75_flow_mangle_ipv4(act, &data);
++			break;
++		case FLOW_ACT_MANGLE_HDR_TYPE_ETH:
++			/* handled earlier */
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++
++		if (err)
++			return err;
++	}
++
++	if (addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
++		err = en75_flow_set_ipv4_addr(&foe, &data, true);
++		if (err)
++			return err;
++	}
++
++	for (i = 0; i < data.vlan.num; i++)
++		en75_foe_entry_set_vlan(&foe, data.vlan.vlans[i].id);
++
++	if (data.pppoe.num == 1)
++		en75_foe_entry_set_pppoe(&foe, data.pppoe.sid);
++
++	/* Stamp the bind timestamp so the aging scan does not cull the entry
++	 * the moment it is committed.
++	 */
++	foe.ib1 &= ~EN75_FOE_IB1_BIND_TIMESTAMP;
++	foe.ib1 |= en75_ppe_timestamp(ppe);
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++
++	entry->cookie = f->cookie;
++	entry->tuple = keytuple;
++	entry->foe = foe;
++	entry->hash = ~0u;
++	entry->state = EN75_FLOW_PENDING;
++
++	/* Stage only: the entry is published into the live table later, by
++	 * en75_ppe_offload_rx_commit(), once the hardware tells us which slot
++	 * it searches for this tuple. Until then the flow stays on the CPU
++	 * path exactly as before.
++	 */
++	err = rhashtable_insert_fast(&ppe->flow_table, &entry->node,
++				     en75_flow_ht_params);
++	if (err < 0) {
++		kfree(entry);
++		return err;
++	}
++
++	err = rhashtable_insert_fast(&ppe->tuple_table, &entry->tuple_node,
++				     en75_tuple_ht_params);
++	if (err < 0) {
++		rhashtable_remove_fast(&ppe->flow_table, &entry->node,
++				       en75_flow_ht_params);
++		kfree(entry);
++		return err;
++	}
++
++	return 0;
++}
++
++static int
++en75_ppe_offload_destroy(struct en75_ppe *ppe, struct flow_cls_offload *f)
++{
++	struct en75_flow_entry *entry;
++	unsigned long flags;
++
++	entry = rhashtable_lookup(&ppe->flow_table, &f->cookie,
++				  en75_flow_ht_params);
++	if (!entry)
++		return -ENOENT;
++
++	rhashtable_remove_fast(&ppe->tuple_table, &entry->tuple_node,
++			       en75_tuple_ht_params);
++	rhashtable_remove_fast(&ppe->flow_table, &entry->node,
++			       en75_flow_ht_params);
++
++	/* Serialise the slot teardown and the DEAD transition against a
++	 * concurrent RX-hint commit of the same entry.
++	 */
++	spin_lock_irqsave(&ppe->foe_lock, flags);
++	if (entry->state == EN75_FLOW_COMMITTED)
++		__en75_ppe_foe_clear(ppe, entry->hash);
++	entry->state = EN75_FLOW_DEAD;
++	spin_unlock_irqrestore(&ppe->foe_lock, flags);
++
++	kfree_rcu(entry, rcu);
++
++	return 0;
++}
++
++static int
++en75_ppe_offload_stats(struct en75_ppe *ppe, struct flow_cls_offload *f)
++{
++	struct en75_flow_entry *entry;
++
++	entry = rhashtable_lookup(&ppe->flow_table, &f->cookie,
++				  en75_flow_ht_params);
++	if (!entry)
++		return -ENOENT;
++
++	/* Hardware accounting is not wired up yet (milestone 2b-4); report the
++	 * flow as freshly used so the software flowtable does not reap it. The
++	 * flow is still torn down via FLOW_CLS_DESTROY when conntrack expires.
++	 */
++	f->stats.lastused = jiffies;
++
++	return 0;
++}
++
++void en75_ppe_offload_rx_commit(struct en75_ppe *ppe, struct sk_buff *skb,
++				u32 hw_slot)
++{
++	struct en75_flow_entry *entry;
++	struct en75_flow_tuple key;
++	unsigned long flags;
++
++	if (IS_ERR_OR_NULL(ppe) || !ppe->tuple_table_ready)
++		return;
++	if (hw_slot >= EN75_PPE_ENTRIES)
++		return;
++
++	en75_flow_tuple_from_skb(&key, skb);
++	if (!key.l4proto)
++		return;
++
++	rcu_read_lock();
++	entry = rhashtable_lookup(&ppe->tuple_table, &key,
++				  en75_tuple_ht_params);
++	if (entry) {
++		spin_lock_irqsave(&ppe->foe_lock, flags);
++		if (entry->state == EN75_FLOW_PENDING) {
++			/* Vendor FoeBindEntry style: rebind the engine's OWN learned
++			 * entry by flipping only ib1 (fresh timestamp + STATE=BIND),
++			 * leaving the body the engine wrote. Overwriting the body made
++			 * the engine re-learn it as UNBIND.
++			 */
++			static atomic_t bdbg = ATOMIC_INIT(12);
++			struct en75_foe_entry e = ppe->foe[hw_slot];
++			u32 os = FIELD_GET(EN75_FOE_IB1_STATE, e.ib1);
++
++			e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
++			e.ib1 |= FIELD_PREP(EN75_FOE_IB1_STATE, EN75_FOE_STATE_BIND);
++			e.ib1 |= en75_ppe_timestamp(ppe);
++			__en75_ppe_foe_commit(ppe, hw_slot, &e);
++			entry->hash = hw_slot;
++			entry->state = EN75_FLOW_COMMITTED;
++			if (atomic_dec_if_positive(&bdbg) >= 0)
++				pr_info("econet-eth: REBIND slot=%u oldstate=%u ib1=%08x->%08x\n",
++					hw_slot, os, ppe->foe[hw_slot].ib1, e.ib1);
++		} else if (entry->state == EN75_FLOW_COMMITTED) {
++			static atomic_t dbg = ATOMIC_INIT(16);
++
++			if (atomic_dec_if_positive(&dbg) >= 0)
++				pr_info("econet-eth: re-miss slot=%u state=%u ib1=%08x\n",
++					entry->hash,
++					(u32)FIELD_GET(EN75_FOE_IB1_STATE, ppe->foe[entry->hash].ib1),
++					ppe->foe[entry->hash].ib1);
++		}
++		spin_unlock_irqrestore(&ppe->foe_lock, flags);
++	}
++	rcu_read_unlock();
++}
++
++static DEFINE_MUTEX(en75_flow_offload_mutex);
++
++int en75_ppe_offload_cmd(struct en75_ppe *ppe, struct flow_cls_offload *cls)
++{
++	int err;
++
++	if (IS_ERR_OR_NULL(ppe) || !ppe->flow_table_ready)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&en75_flow_offload_mutex);
++	switch (cls->command) {
++	case FLOW_CLS_REPLACE:
++		err = en75_ppe_offload_replace(ppe, cls);
++		break;
++	case FLOW_CLS_DESTROY:
++		err = en75_ppe_offload_destroy(ppe, cls);
++		break;
++	case FLOW_CLS_STATS:
++		err = en75_ppe_offload_stats(ppe, cls);
++		break;
++	default:
++		err = -EOPNOTSUPP;
++		break;
++	}
++	mutex_unlock(&en75_flow_offload_mutex);
++
++	return err;
++}
++
++/*
++ * Indirect flow blocks. Without DSA the kernel flowtable offers a flow on the
++ * higher-layer device it traverses (a bridge or VLAN), which has no
++ * ndo_setup_tc of its own, so the offload is delivered through the indirect
++ * block mechanism instead of the port's direct ndo_setup_tc. We accept every
++ * such device: a flow that does not actually traverse our hardware simply
++ * never matches a packet and ages out, and milestone 2b-3a forces every bound
++ * flow to the CPU anyway. 3b will narrow this to devices that resolve to a GDM
++ * port and pick the egress accordingly.
++ */
++struct en75_indr_priv {
++	struct list_head list;
++	struct net_device *dev;
++	struct en75_ppe *ppe;
++};
++
++static LIST_HEAD(en75_indr_block_cb_list);
++
++static int en75_setup_indr_block_cb(enum tc_setup_type type, void *type_data,
++				    void *cb_priv)
++{
++	struct en75_indr_priv *priv = cb_priv;
++
++	if (type != TC_SETUP_CLSFLOWER)
++		return -EOPNOTSUPP;
++
++	return en75_ppe_offload_cmd(priv->ppe, type_data);
++}
++
++static struct en75_indr_priv *
++en75_indr_block_cb_lookup(struct en75_ppe *ppe, struct net_device *dev)
++{
++	struct en75_indr_priv *priv;
++
++	list_for_each_entry(priv, &ppe->indr_block_list, list)
++		if (priv->dev == dev)
++			return priv;
++
++	return NULL;
++}
++
++static void en75_setup_indr_rel(void *cb_priv)
++{
++	struct en75_indr_priv *priv = cb_priv;
++
++	list_del(&priv->list);
++	kfree(priv);
++}
++
++static int en75_setup_indr_block(struct net_device *dev, struct Qdisc *sch,
++				 struct en75_ppe *ppe,
++				 struct flow_block_offload *f, void *data,
++				 void (*cleanup)(struct flow_block_cb *block_cb))
++{
++	struct en75_indr_priv *cb_priv;
++	struct flow_block_cb *block_cb;
++
++	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
++
++	switch (f->command) {
++	case FLOW_BLOCK_BIND:
++		cb_priv = kmalloc(sizeof(*cb_priv), GFP_KERNEL);
++		if (!cb_priv)
++			return -ENOMEM;
++
++		cb_priv->dev = dev;
++		cb_priv->ppe = ppe;
++		list_add(&cb_priv->list, &ppe->indr_block_list);
++
++		block_cb = flow_indr_block_cb_alloc(en75_setup_indr_block_cb,
++						    cb_priv, cb_priv,
++						    en75_setup_indr_rel, f,
++						    dev, sch, data, ppe,
++						    cleanup);
++		if (IS_ERR(block_cb)) {
++			list_del(&cb_priv->list);
++			kfree(cb_priv);
++			return PTR_ERR(block_cb);
++		}
++
++		flow_block_cb_add(block_cb, f);
++		list_add_tail(&block_cb->driver_list, &en75_indr_block_cb_list);
++		return 0;
++	case FLOW_BLOCK_UNBIND:
++		cb_priv = en75_indr_block_cb_lookup(ppe, dev);
++		if (!cb_priv)
++			return -ENOENT;
++
++		block_cb = flow_block_cb_lookup(f->block,
++						en75_setup_indr_block_cb,
++						cb_priv);
++		if (!block_cb)
++			return -ENOENT;
++
++		flow_indr_block_cb_remove(block_cb, f);
++		list_del(&block_cb->driver_list);
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int en75_setup_indr_cb(struct net_device *dev, struct Qdisc *sch,
++			      void *cb_priv, enum tc_setup_type type,
++			      void *type_data, void *data,
++			      void (*cleanup)(struct flow_block_cb *block_cb))
++{
++	struct en75_ppe *ppe = cb_priv;
++
++	if (!dev)
++		return -EOPNOTSUPP;
++
++	switch (type) {
++	case TC_SETUP_BLOCK:
++	case TC_SETUP_FT:
++		return en75_setup_indr_block(dev, sch, ppe, type_data, data,
++					     cleanup);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++int en75_ppe_offload_init(struct en75_ppe *ppe)
++{
++	int err;
++
++	INIT_LIST_HEAD(&ppe->indr_block_list);
++
++	err = rhashtable_init(&ppe->flow_table, &en75_flow_ht_params);
++	if (err)
++		return err;
++
++	err = rhashtable_init(&ppe->tuple_table, &en75_tuple_ht_params);
++	if (err) {
++		rhashtable_destroy(&ppe->flow_table);
++		return err;
++	}
++
++	err = flow_indr_dev_register(en75_setup_indr_cb, ppe);
++	if (err) {
++		rhashtable_destroy(&ppe->tuple_table);
++		rhashtable_destroy(&ppe->flow_table);
++		return err;
++	}
++
++	ppe->flow_table_ready = true;
++	ppe->tuple_table_ready = true;
++
++	return 0;
++}
++
++static void en75_flow_free_cb(void *ptr, void *arg)
++{
++	kfree(ptr);
++}
++
++void en75_ppe_offload_deinit(struct en75_ppe *ppe)
++{
++	if (!ppe->flow_table_ready)
++		return;
++
++	ppe->flow_table_ready = false;
++	ppe->tuple_table_ready = false;
++	flow_indr_dev_unregister(en75_setup_indr_cb, ppe, en75_setup_indr_rel);
++	/* Wait out any RX-hint lookup that already passed the ready check. */
++	synchronize_rcu();
++	/* Drop the tuple index first so no RX commit can find an entry while
++	 * the cookie table is being torn down and the entries freed.
++	 */
++	rhashtable_destroy(&ppe->tuple_table);
++	rhashtable_free_and_destroy(&ppe->flow_table, en75_flow_free_cb, NULL);
++}

@@ -1,0 +1,79 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: only offload flows whose egress is the GDM netdev
+
+Every accepted flow is bound with PSE egress GDM1 (patch 130), but the
+FLOW_ACTION_REDIRECT target device was never checked ("3b" was never
+finished). Flows towards a Wi-Fi client also reach us - through the
+indirect flow block on phy0-ap0/phy1-ap0 or with the redirect pointing
+at the other direction's ingress when the forward path does not resolve
+(XMIT_NEIGH) - and carry a perfectly valid L2 rewrite (dst = station
+MAC), so they bound too. The hardware then switched those packets out
+the wired MT7530 ports where the station's MAC never lives: download to
+any Wi-Fi client black-holed as soon as the flow bound, which is why
+speed tests over Wi-Fi never started while wired stayed at line rate.
+
+Record GDM1's netdev on the PPE at probe and reject any flow whose
+redirect target is a different device; those flows now stay on the
+(software) flowtable path. Wired flows still resolve to the GDM netdev
+and keep full hardware offload.
+--- a/econet_ppe.h	2026-07-03 09:08:55.338745936 +0300
++++ b/econet_ppe.h	2026-07-03 09:08:55.366744391 +0300
+@@ -149,6 +149,8 @@
+ 
+ struct en75_ppe {
+ 	struct device		*dev;
++	/* GDM1's netdev: the only egress the FOE can forward to. */
++	struct net_device	*ndev;
+ 	void __iomem		*base;
+ 	/* frame-engine timestamp register window, for FOE aging stamps. */
+ 	void __iomem		*fe;
+--- a/econet_port.c	2026-07-03 09:08:55.342745715 +0300
++++ b/econet_port.c	2026-07-03 09:08:55.366744391 +0300
+@@ -144,6 +144,10 @@
+ 	u32 old;
+ 
+ 	port->ppe = ppe;
++	/* Bound FOE entries always egress via GDM1 (the first port); remember
++	 * its netdev so the offload path can refuse flows leaving elsewhere. */
++	if (!ppe->ndev)
++		ppe->ndev = dev;
+ 
+ 	guard(spinlock)(&port->reg_lock);
+ 	fc = en75_rreg(&port->regs->fwd_cfg);
+--- a/econet_ppe_offload.c	2026-07-03 09:08:55.346745495 +0300
++++ b/econet_ppe_offload.c	2026-07-03 09:08:55.366744391 +0300
+@@ -309,6 +309,7 @@
+ 	u16 addr_type = 0;
+ 	u8 l4proto = 0;
+ 	struct en75_flow_tuple keytuple;
++	struct net_device *odev = NULL;
+ 	int err = 0;
+ 	int i;
+ 
+@@ -359,7 +360,7 @@
+ 				en75_flow_offload_mangle_eth(act, &data.eth);
+ 			break;
+ 		case FLOW_ACTION_REDIRECT:
+-			/* odev: used to pick the egress port in 3b. */
++			odev = act->dev;
+ 			break;
+ 		case FLOW_ACTION_CSUM:
+ 			break;
+@@ -386,6 +387,17 @@
+ 		}
+ 	}
+ 
++	/* The FOE entry can only egress via GDM1, i.e. out of the wired
++	 * MT7530 ports. A flow whose output device is anything else - a
++	 * Wi-Fi netdev, or the ingress side of an unresolved forward path
++	 * (XMIT_NEIGH redirects to the other direction's iif) - must stay
++	 * on the software path: binding it would switch the packets out
++	 * the wired ports and black-hole the flow. This is what broke
++	 * Wi-Fi clients' download while wired stayed at line rate.
++	 */
++	if (!odev || odev != ppe->ndev)
++		return -EOPNOTSUPP;
++
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest)) {
+ 		static atomic_t rejdumps = ATOMIC_INIT(0);

@@ -1,0 +1,57 @@
+#!/bin/sh
+# Archer C5v ön panel LED durum daemon'u (firmware'e gömülü).
+#  - blue:wan         : fiziksel WAN portu link (MT7530 port, econet-eth wan_link param)
+#  - blue:wan-online  : internete çıkış var (mavi)
+#  - red:wan          : internet yok (kırmızı)
+# LED'ler yoksa (başka econet cihazı) sessizce çıkar.
+
+WAN_LINK=/sys/module/econet_eth/parameters/wan_link
+LEDS=/sys/class/leds
+
+# Bu cihazda ilgili LED'ler yoksa daemon'a gerek yok
+[ -d "$LEDS/blue:wan" ] || [ -d "$LEDS/blue:wan-online" ] || exit 0
+
+set_led() {
+	[ -d "$LEDS/$1" ] || return
+	echo none > "$LEDS/$1/trigger" 2>/dev/null
+	echo "$2" > "$LEDS/$1/brightness" 2>/dev/null
+}
+
+# trigger'ları kapat (manuel kontrol)
+set_led "blue:wan" 0
+set_led "blue:wan-online" 0
+set_led "red:wan" 0
+
+set_internet() {   # $1 = 1 (var) / 0 (yok)
+	if [ "$1" = "$last_net" ]; then return; fi
+	set_led "blue:wan-online" "$1"
+	set_led "red:wan" "$([ "$1" = 1 ] && echo 0 || echo 1)"
+	last_net="$1"
+}
+
+i=0
+last_link=-1
+last_net=-1
+while : ; do
+	# WAN portu kablo/link (her döngü, ucuz lokal okuma)
+	if [ -e "$WAN_LINK" ]; then
+		link=$(cat "$WAN_LINK" 2>/dev/null)
+		[ "$link" != "$last_link" ] && { set_led "blue:wan" "$link"; last_link="$link"; }
+	fi
+
+	# internet durumu:
+	#  - default route yoksa => kesin internet yok, ANINDA kırmızı (lokal, pingsiz)
+	#  - route varsa => 30 sn'de bir ping ile gerçek erişimi teyit et
+	if ! ip route show default 2>/dev/null | grep -q .; then
+		set_internet 0
+	elif [ $((i % 10)) -eq 0 ]; then
+		if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
+			set_internet 1
+		else
+			set_internet 0
+		fi
+	fi
+
+	i=$((i + 1))
+	sleep 3
+done

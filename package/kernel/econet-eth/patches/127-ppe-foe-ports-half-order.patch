@@ -1,0 +1,43 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: fix L4 ports half-order in FOE tuple (BE host)
+
+The FOE entry stored a correct slot and correct IP addresses but the engine
+still returned UN_HIT on every committed BIND entry. Root cause: the L4 ports
+word packs two u16s and its half-order was wrong on this big-endian SoC.
+
+Mainline mtk_ppe writes the named fields of a struct laid out as
+{ u16 dest_port; u16 src_port; }, which on little-endian puts dest_port in the
+low 16 bits and src_port in the high 16 bits -> LE memory [dest_port][src_port].
+econet packed the ports u32 manually as (dest_port << 16) | src_port; after the
+whole-entry cpu_to_le32 conversion on this BE host that lands in memory as
+[src_port][dest_port] -- the two halves swapped vs what the hardware compares.
+IP addresses are single u32s so they were unaffected; only the ports word
+(two u16s) flips under BE, which is why entries sat at the right slot with the
+right addresses yet never matched.
+
+Pack (src_port << 16) | dest_port so the little-endian table memory matches
+mainline. Applies to the IPv4 HNAPT/route tuple and the IPv6 5-tuple.
+
+diff -ruN b126/econet_foe.c b127/econet_foe.c
+--- a/econet_foe.c	2026-06-29 01:10:29.695242151 +0300
++++ b/econet_foe.c	2026-06-29 01:10:29.755238980 +0300
+@@ -184,7 +184,7 @@
+ 	if (type == EN75_PPE_PKT_TYPE_IPV4_ROUTE)
+ 		return 0;
+ 
+-	t->ports = ((u32)be16_to_cpu(dest_port) << 16) | be16_to_cpu(src_port);
++	t->ports = ((u32)be16_to_cpu(src_port) << 16) | be16_to_cpu(dest_port);
+ 
+ 	return 0;
+ }
+@@ -204,8 +204,8 @@
+ 
+ 	switch (type) {
+ 	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T:
+-		entry->ipv6.ports = ((u32)be16_to_cpu(dest_port) << 16) |
+-				    be16_to_cpu(src_port);
++		entry->ipv6.ports = ((u32)be16_to_cpu(src_port) << 16) |
++				    be16_to_cpu(dest_port);
+ 		fallthrough;
+ 	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T:
+ 		break;

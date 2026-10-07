@@ -1,0 +1,94 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: place IPv4 binds at the real engine hash slot
+
+The descriptor's ppe_entry field only addresses the low ~40% of the table
+(14 bits, truncated), so for most flows find_engine_slot fell back to a scan
+that could not find an UNBIND the engine had already auto-bound to garbage
+(FORWARD_BUILD) - binds stalled (noslot climbing, 0f exploding, throughput
+below the software flowtable).
+
+Recover the engine's actual IPv4 FOE hash from the vendor FoeHashFun (MODE1,
+decoded from hw_nat.dis) and verify it on hardware against learned UNBIND
+slots: 30/30 exact. FoeHashFun returns the descriptor-scaled value
+(real_slot * 5/2), so the table index is hash * 2 / 5. Compute the slot
+straight from the staged tuple and bind there - no descriptor, no scan, valid
+for every flow, and it beats the engine's auto-bind to the slot. IPv6 keeps the
+descriptor+scan path for now (its hash uses a different, multi-word input).
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -624,12 +624,50 @@
+  * scaled guess and fell through to the full scan, pinning the CPU in softirq).
+  * The scan stays only as a safety net for a genuinely unexpected descriptor.
+  */
++/*
++ * The engine's FOE hash for IPv4, recovered from the vendor FoeHashFun (MODE1
++ * path, decoded from hw_nat.dis) and verified on hardware against the engine's
++ * learned UNBIND slots (30/30 exact). FoeHashFun returns the descriptor-scaled
++ * value (real_slot * 5/2), so the live table index is that * 2 / 5. Inputs are
++ * the host-order orig tuple, exactly as staged in entry->foe:
++ *   s1 = ports, s3 = dest_ip, s6 = src_ip
++ *   s7 = (~s1 & s6) | (s3 & s1)
++ *   s2 = (s1 ^ s3 ^ s6) ^ ror32(s7, 24)
++ *   fold = (s2 & 0x1fff) ^ ((s2 >> 13) & 0x1fff) ^ (s2 >> 26)
++ *   slot = ((fold & 0x1fff) << 1) * 2 / 5
++ * This places the BIND at the exact slot the engine searches, with no
++ * descriptor hint and no table scan, so it works for every flow (not just the
++ * ~40% the 14-bit descriptor field could address) and beats the engine's own
++ * FORWARD_BUILD auto-bind to the slot.
++ */
++static u32 en75_ppe_ipv4_hash_slot(const struct en75_foe_entry *want)
++{
++	u32 s1 = want->ipv4.orig.ports;
++	u32 s3 = want->ipv4.orig.dest_ip;
++	u32 s6 = want->ipv4.orig.src_ip;
++	u32 s7 = ((~s1) & s6) | (s3 & s1);
++	u32 s2 = (s1 ^ s3 ^ s6) ^ ((s7 >> 24) | (s7 << 8));	/* ^ ror32(s7,24) */
++	u32 fold = ((s2 & 0x1fff) ^ ((s2 >> 13) & 0x1fff) ^ (s2 >> 26)) & 0x1fff;
++
++	return ((fold << 1) * 2) / 5;
++}
++
+ static int en75_ppe_find_engine_slot(struct en75_ppe *ppe,
+ 				     const struct en75_foe_entry *want,
+ 				     u32 hw_slot)
+ {
++	u32 type = FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, want->ib1);
+ 	u32 i, cand;
+ 
++	/* IPv4: compute the engine's search slot straight from the tuple. */
++	if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT ||
++	    type == EN75_PPE_PKT_TYPE_IPV4_ROUTE) {
++		i = en75_ppe_ipv4_hash_slot(want);
++		return (i < EN75_PPE_ENTRIES) ? (int)i : -1;
++	}
++
++	/* IPv6 uses a different hash; fall back to the descriptor-scaled
++	 * candidate plus a scan for the engine's learned UNBIND. */
+ 	cand = (hw_slot + (hw_slot % 5) * EN75_PPE_ENTRIES) * 2 / 5;
+ 	if (en75_ppe_slot_matches(ppe, cand, want))
+ 		return cand;
+@@ -638,23 +676,6 @@
+ 		if (en75_ppe_slot_matches(ppe, i, want))
+ 			return i;
+ 
+-	/* DIAGNOSTIC: neither the computed candidate nor a full scan found an
+-	 * UNBIND entry matching this flow. Dump the candidate's actual contents
+-	 * and the wanted tuple so we can tell a wrong-slot (formula) miss from
+-	 * the engine having already auto-bound the slot (FORWARD_BUILD garbage)
+-	 * or never having learned an UNBIND at all. */
+-	{
+-		u32 ib1 = (cand < EN75_PPE_ENTRIES) ?
+-			  le32_to_cpu(READ_ONCE(ppe->foe[cand].ib1)) : 0;
+-
+-		pr_info_ratelimited("econet-eth: noslot hw=%u cand=%u state@cand=%lu type@cand=%lu | want type=%lu sip=%08x dip=%08x ports=%08x\n",
+-				    hw_slot, cand,
+-				    FIELD_GET(EN75_FOE_IB1_STATE, ib1),
+-				    FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1),
+-				    FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, want->ib1),
+-				    want->ipv4.orig.src_ip, want->ipv4.orig.dest_ip,
+-				    want->ipv4.orig.ports);
+-	}
+ 	return -1;
+ }
+ 

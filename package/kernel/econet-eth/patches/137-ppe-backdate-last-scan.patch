@@ -1,0 +1,30 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: backdate last_scan so binds work before 5 min uptime
+
+The RX commit rate-limits its per-flow slot scan with a jiffies backoff, but
+a freshly kzalloc'd flow entry has last_scan = 0. Linux starts jiffies at
+INITIAL_JIFFIES (-300*HZ) to flush out exactly this class of bug, so a zero
+last_scan reads as "scanned ~300s in the future": time_before(jiffies, 0 +
+HZ/10) is true and the backoff suppresses every commit for the first ~5
+minutes of uptime. Live counters confirmed it: at 3 min uptime backoff=412815,
+bound=0; the moment uptime crossed 300s bound started climbing on its own.
+
+Backdate last_scan by 1s (> the HZ/10 backoff) when the entry is staged so the
+first bind hint always proceeds, independent of the jiffies sign.
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -472,6 +472,13 @@
+ 	entry->foe = foe;
+ 	entry->hash = ~0u;
+ 	entry->state = EN75_FLOW_PENDING;
++	/* Let the first RX bind hint scan immediately. kzalloc leaves last_scan
++	 * = 0, but jiffies starts at INITIAL_JIFFIES (-300*HZ), so a zero reads
++	 * as "scanned ~300s in the future" and the backoff check suppresses every
++	 * commit for the first ~5 min of uptime (observed: backoff=412815,
++	 * bound=0 at 3 min uptime). Backdate by 1s (> the HZ/10 backoff) so the
++	 * first attempt always proceeds regardless of the jiffies sign. */
++	entry->last_scan = jiffies - HZ;
+ 
+ 	/* Stage only: the entry is published into the live table later, by
+ 	 * en75_ppe_offload_rx_commit(), once the hardware tells us which slot

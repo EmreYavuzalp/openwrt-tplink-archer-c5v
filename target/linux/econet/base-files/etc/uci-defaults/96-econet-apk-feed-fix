@@ -1,0 +1,11 @@
+#!/bin/sh
+# econet is an out-of-tree OpenWrt port, so downloads.openwrt.org has no
+# targets/econet/<subtarget>/packages feed. apk logs a 404 ("wget error 8 /
+# unexpected end of file") on every update against it, even though packages
+# still install from the working base architecture feed. Drop the dead
+# target feed so the error goes away. The target kmods are built into the
+# image; users never apk-install them.
+for f in /etc/apk/repositories.d/distfeeds.list /etc/apk/repositories; do
+	[ -f "$f" ] && sed -i '\#/targets/econet/#d' "$f"
+done
+exit 0

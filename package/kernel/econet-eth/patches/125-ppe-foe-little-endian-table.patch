@@ -1,0 +1,209 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: store the whole FOE entry little-endian (BE host fix)
+
+The PPE FOE table is little-endian regardless of CPU endianness, but only
+the L3 tuple words were being byte-swapped on this big-endian SoC. ib1
+(STATE/PACKET_TYPE/timestamp), ib2 and the rewrite L2 header were written
+in host (big-endian) order, so the engine read a BIND entry with STATE!=BIND
+and PACKET_TYPE garbage -> every lookup returned UN_HIT and no flow ever
+bound (crsn 0x16 never seen). The earlier "FORWARD_BUILD learns 6rd/dslite
+garbage" symptom was the same artifact seen from the other direction: the
+hardware had written valid little-endian IPv4-HNAPT entries that the BE CPU
+then mis-decoded (a valid ib1 ~0x2140xxxx reads back as PACKET_TYPE 3/4/7).
+
+Fix: build entries in host byte order throughout, and convert the entire
+80-byte entry word-by-word to little-endian at the single hardware boundary
+(__en75_ppe_foe_commit). Read the live table back through le32_to_cpu in the
+clear path and in every debug dump. The L3 tuple swab32 in econet_foe.c is
+removed (it is now covered by the whole-entry conversion; swab32 there plus
+the boundary swap would double-swap).
+
+diff -ruN b124/econet_foe.c b125/econet_foe.c
+--- a/econet_foe.c	2026-06-29 00:15:45.682568920 +0300
++++ b/econet_foe.c	2026-06-29 00:16:51.608152590 +0300
+@@ -175,18 +175,16 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	/* The FOE table is little-endian but this SoC is big-endian, so the
+-	 * engine reads each tuple word byte-reversed from host order. Store
+-	 * the swapped value so the hardware sees the correct address/ports.
++	/* Build the tuple in host byte order. __en75_ppe_foe_commit() converts
++	 * the whole entry to the little-endian layout the engine reads.
+ 	 */
+-	t->src_ip = swab32(be32_to_cpu(src_addr));
+-	t->dest_ip = swab32(be32_to_cpu(dest_addr));
++	t->src_ip = be32_to_cpu(src_addr);
++	t->dest_ip = be32_to_cpu(dest_addr);
+ 
+ 	if (type == EN75_PPE_PKT_TYPE_IPV4_ROUTE)
+ 		return 0;
+ 
+-	t->ports = swab32(((u32)be16_to_cpu(dest_port) << 16) |
+-			  be16_to_cpu(src_port));
++	t->ports = ((u32)be16_to_cpu(dest_port) << 16) | be16_to_cpu(src_port);
+ 
+ 	return 0;
+ }
+@@ -206,8 +204,8 @@
+ 
+ 	switch (type) {
+ 	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T:
+-		entry->ipv6.ports = swab32(((u32)be16_to_cpu(dest_port) << 16) |
+-				   be16_to_cpu(src_port));
++		entry->ipv6.ports = ((u32)be16_to_cpu(dest_port) << 16) |
++				    be16_to_cpu(src_port);
+ 		fallthrough;
+ 	case EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T:
+ 		break;
+@@ -217,8 +215,8 @@
+ 	}
+ 
+ 	for (i = 0; i < 4; i++) {
+-		entry->ipv6.src_ip[i] = swab32(be32_to_cpu(src_addr[i]));
+-		entry->ipv6.dest_ip[i] = swab32(be32_to_cpu(dest_addr[i]));
++		entry->ipv6.src_ip[i] = be32_to_cpu(src_addr[i]);
++		entry->ipv6.dest_ip[i] = be32_to_cpu(dest_addr[i]);
+ 	}
+ 
+ 	return 0;
+diff -ruN b124/econet_ppe.c b125/econet_ppe.c
+--- a/econet_ppe.c	2026-06-29 00:16:02.869936954 +0300
++++ b/econet_ppe.c	2026-06-29 00:16:51.608152590 +0300
+@@ -60,20 +60,30 @@
+ 			   struct en75_foe_entry *entry)
+ {
+ 	struct en75_foe_entry *hwe = &ppe->foe[hash];
+-
+-	/* Body before ib1: the engine must never see a BIND-state entry with a
+-	 * half-written tuple or rewrite header.
++	const u32 *src = (const u32 *)entry;
++	u32 *dst = (u32 *)hwe;
++	size_t i, words = sizeof(*hwe) / sizeof(u32);
++
++	/* The FOE table is little-endian but this SoC is big-endian, so every
++	 * 32-bit word of the entry (ib1, tuple, rewrite header, ib2) must be
++	 * byte-swapped into the table. ib1 (word 0) holds the BIND state, so
++	 * publish the body words first and ib1 last: the engine must never see
++	 * a BIND-state entry whose body is half-written.
+ 	 */
+-	memcpy(hwe->data, entry->data, sizeof(hwe->data));
++	for (i = 1; i < words; i++)
++		dst[i] = cpu_to_le32(src[i]);
+ 	wmb();
+-	hwe->ib1 = entry->ib1;
++	dst[0] = cpu_to_le32(src[0]);
+ 	dma_wmb();
+ 	en75_ppe_cache_clear(ppe);
+ }
+ 
+ void __en75_ppe_foe_clear(struct en75_ppe *ppe, u32 hash)
+ {
+-	ppe->foe[hash].ib1 &= ~EN75_FOE_IB1_STATE;
++	u32 ib1 = le32_to_cpu(ppe->foe[hash].ib1);
++
++	ib1 &= ~EN75_FOE_IB1_STATE;
++	ppe->foe[hash].ib1 = cpu_to_le32(ib1);
+ 	dma_wmb();
+ 	en75_ppe_cache_clear(ppe);
+ }
+@@ -130,7 +140,7 @@
+ 	unsigned int i, shown = 0;
+ 
+ 	for (i = 0; i < EN75_PPE_ENTRIES; i++) {
+-		u32 ib1 = READ_ONCE(ppe->foe[i].ib1);
++		u32 ib1 = le32_to_cpu(READ_ONCE(ppe->foe[i].ib1));
+ 
+ 		counts[FIELD_GET(EN75_FOE_IB1_STATE, ib1)]++;
+ 	}
+@@ -142,7 +152,7 @@
+ 		   counts[EN75_FOE_STATE_BIND], counts[EN75_FOE_STATE_FIN]);
+ 
+ 	for (i = 0; i < EN75_PPE_ENTRIES; i++) {
+-		u32 ib1 = READ_ONCE(ppe->foe[i].ib1);
++		u32 ib1 = le32_to_cpu(READ_ONCE(ppe->foe[i].ib1));
+ 		u32 state = FIELD_GET(EN75_FOE_IB1_STATE, ib1);
+ 		u32 type = FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1);
+ 
+@@ -159,7 +169,9 @@
+ 			struct en75_foe_ipv4 *e = &ppe->foe[i].ipv4;
+ 
+ 			seq_printf(m, " orig sip=%08x dip=%08x ports=%08x",
+-				   e->orig.src_ip, e->orig.dest_ip, e->orig.ports);
++				   le32_to_cpu(e->orig.src_ip),
++				   le32_to_cpu(e->orig.dest_ip),
++				   le32_to_cpu(e->orig.ports));
+ 		}
+ 		seq_putc(m, '\n');
+ 	}
+@@ -173,7 +185,7 @@
+ 
+ static void en75_ppe_foe_dump_slot(struct seq_file *m, struct en75_ppe *ppe, u32 i)
+ {
+-	u32 ib1 = READ_ONCE(ppe->foe[i].ib1);
++	u32 ib1 = le32_to_cpu(READ_ONCE(ppe->foe[i].ib1));
+ 	u32 state = FIELD_GET(EN75_FOE_IB1_STATE, ib1);
+ 	u32 type = FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1);
+ 	struct en75_foe_ipv4 *e;
+@@ -197,10 +209,12 @@
+ 
+ 	e = &ppe->foe[i].ipv4;
+ 	seq_printf(m, " orig sip=%08x dip=%08x ports=%08x\n",
+-		   e->orig.src_ip, e->orig.dest_ip, e->orig.ports);
++		   le32_to_cpu(e->orig.src_ip), le32_to_cpu(e->orig.dest_ip),
++		   le32_to_cpu(e->orig.ports));
+ 	if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT)
+ 		seq_printf(m, " new  sip=%08x dip=%08x ports=%08x ib2=%08x\n",
+-			   e->new.src_ip, e->new.dest_ip, e->new.ports, e->ib2);
++			   le32_to_cpu(e->new.src_ip), le32_to_cpu(e->new.dest_ip),
++			   le32_to_cpu(e->new.ports), le32_to_cpu(e->ib2));
+ }
+ 
+ static int en75_ppe_foe_slot_show(struct seq_file *m, void *v)
+@@ -265,7 +279,10 @@
+ 
+ 	if (buf[0] == '0') {
+ 		if (ppe->test_hash != ~0u) {
+-			ppe->foe[ppe->test_hash].ib1 &= ~EN75_FOE_IB1_STATE;
++			u32 ib1 = le32_to_cpu(ppe->foe[ppe->test_hash].ib1);
++
++			ppe->foe[ppe->test_hash].ib1 =
++				cpu_to_le32(ib1 & ~EN75_FOE_IB1_STATE);
+ 			dma_wmb();
+ 			en75_ppe_cache_clear(ppe);
+ 			ppe->test_hash = ~0u;
+diff -ruN b124/econet_ppe_offload.c b125/econet_ppe_offload.c
+--- a/econet_ppe_offload.c	2026-06-29 00:15:45.690568626 +0300
++++ b/econet_ppe_offload.c	2026-06-29 00:16:51.608152590 +0300
+@@ -578,14 +578,14 @@
+ 					"state=%u ib1@%u=%08x skb %pI4:%u->%pI4:%u "
+ 					"orig %08x/%08x/%08x new %08x/%08x/%08x ib2=%08x%s\n",
+ 					entry->hash, hw_slot,
+-					(u32)FIELD_GET(EN75_FOE_IB1_STATE, ppe->foe[entry->hash].ib1),
++					(u32)FIELD_GET(EN75_FOE_IB1_STATE, le32_to_cpu(ppe->foe[entry->hash].ib1)),
+ 					entry->hash,
+-					ppe->foe[entry->hash].ib1,
++					le32_to_cpu(ppe->foe[entry->hash].ib1),
+ 					&key.src[0], ntohs(key.sport),
+ 					&key.dst[0], ntohs(key.dport),
+-					o->src_ip, o->dest_ip, o->ports,
+-					n->src_ip, n->dest_ip, n->ports,
+-					v4->ib2,
++					le32_to_cpu(o->src_ip), le32_to_cpu(o->dest_ip), le32_to_cpu(o->ports),
++					le32_to_cpu(n->src_ip), le32_to_cpu(n->dest_ip), le32_to_cpu(n->ports),
++					le32_to_cpu(v4->ib2),
+ 					hw_slot != entry->hash ?
+ 					" SLOT-MISMATCH" : "");
+ 			}
+@@ -594,8 +594,9 @@
+ 				o = &ppe->foe[hw_slot].ipv4.orig;
+ 				pr_info("econet-eth: re-miss hw_slot=%u ib1=%08x "
+ 					"foe-orig %08x/%08x/%08x\n",
+-					hw_slot, ppe->foe[hw_slot].ib1,
+-					o->src_ip, o->dest_ip, o->ports);
++					hw_slot, le32_to_cpu(ppe->foe[hw_slot].ib1),
++					le32_to_cpu(o->src_ip), le32_to_cpu(o->dest_ip),
++					le32_to_cpu(o->ports));
+ 			}
+ 		}
+ 		spin_unlock_irqrestore(&ppe->foe_lock, flags);

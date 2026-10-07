@@ -1,0 +1,42 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: dump decoded L2 trailer from foe_slot
+
+The remaining offload failure is suspected to be in the FOE mac_info trailer,
+but devmem word reads are easy to misinterpret on this big-endian CPU with a
+little-endian FOE table and intentionally reversed u16 pairs. Extend foe_slot
+with the raw host-order L2 words and a decoded MAC/VLAN view from those exact
+words. This lets hardware logs prove whether dest_mac_hi/dest_mac_lo/src_mac_lo
+are really wrong before changing the mac_info layout again.
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -215,6 +215,29 @@ static void en75_ppe_foe_dump_slot(struct seq_file *m, struct en75_ppe *ppe, u32
+ 	if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT)
+ 		seq_printf(m, " new  sip=%08x dip=%08x ports=%08x ib2=%08x\n",
+ 			   le32_to_cpu(e->new.src_ip), le32_to_cpu(e->new.dest_ip),
+ 			   le32_to_cpu(e->new.ports), le32_to_cpu(e->ib2));
++
++	{
++		const u32 *raw = (const u32 *)&ppe->foe[i];
++		u32 w11 = le32_to_cpu(READ_ONCE(raw[11]));
++		u32 w12 = le32_to_cpu(READ_ONCE(raw[12]));
++		u32 w13 = le32_to_cpu(READ_ONCE(raw[13]));
++		u32 w14 = le32_to_cpu(READ_ONCE(raw[14]));
++		u32 w15 = le32_to_cpu(READ_ONCE(raw[15]));
++		u8 dst[ETH_ALEN] = {
++			w12 >> 24, w12 >> 16, w12 >> 8, w12,
++			w13 >> 24, w13 >> 16,
++		};
++		u8 src[ETH_ALEN] = {
++			w14 >> 24, w14 >> 16, w14 >> 8, w14,
++			w15 >> 24, w15 >> 16,
++		};
++
++		seq_printf(m, " l2raw w11=%08x w12=%08x w13=%08x w14=%08x w15=%08x\n",
++			   w11, w12, w13, w14, w15);
++		seq_printf(m, " l2dec dst=%pM src=%pM etype=%04x vlan1=%u vlan2=%u pppoe=%04x\n",
++			   dst, src, w11 >> 16, w11 & 0xffff,
++			   w13 & 0xffff, w15 & 0xffff);
++	}
+ }
+ 
+ static int en75_ppe_foe_slot_show(struct seq_file *m, void *v)

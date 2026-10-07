@@ -1,0 +1,115 @@
+From: OpenAI Codex <codex@local>
+Subject: econet-eth: re-apply external MT7530 VLAN split after probe
+
+On Archer C5v the external MT7530 can occasionally end up with the CPU/TRGMII
+path not forwarding frames to the SoC after boot. The netdev stays up and TX
+is visible locally, but RX remains at zero until the switch is initialized again
+(for example after reflashing the same image).
+
+Re-apply the same external switch VLAN split a few times after probe. This is
+idempotent and keeps the existing VLAN layout unchanged while covering the
+late-settle/reset race seen on this board.
+---
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -38,6 +38,7 @@
+ #include <linux/reset.h>
+ #include <linux/of_net.h>
+ #include <linux/iopoll.h>
++#include <linux/workqueue.h>
+ 
+ #include "gdm_regs.h"
+ #include "linux/dev_printk.h"
+@@ -174,6 +175,8 @@
+ 	int				qdma_irq[EN75_NUM_QDMA * QDMA_NUM_IRQS];
+ 	struct en75_qdma		*qdma[EN75_NUM_QDMA];
+ 	struct en75_debug		*debug;
++	struct delayed_work		mt7530_reapply_work;
++	unsigned int			mt7530_reapply_count;
+ };
+ 
+ union gdm_regs {
+@@ -532,6 +535,56 @@
+ 	return 0;
+ }
+ 
++#define EN75_MT7530_REAPPLY_MAX	3
++
++static unsigned int en75_ext_switch_reapply_delay_ms(unsigned int attempt)
++{
++	switch (attempt) {
++	case 0:
++		return 2000;
++	case 1:
++		return 10000;
++	default:
++		return 30000;
++	}
++}
++
++static void en75_ext_switch_reapply_work(struct work_struct *work)
++{
++	struct delayed_work *dwork = to_delayed_work(work);
++	struct en75_eth_pvt *eth = container_of(dwork, struct en75_eth_pvt,
++						 mt7530_reapply_work);
++	unsigned int attempt = eth->mt7530_reapply_count + 1;
++	int err;
++
++	err = en75_ext_switch_configure_vlan_split(eth);
++	if (err)
++		dev_warn(eth->pub.dev,
++			 "failed to re-apply external MT7530 VLAN split attempt %u: %d\n",
++			 attempt, err);
++	else
++		dev_info(eth->pub.dev,
++			 "re-applied external MT7530 VLAN split attempt %u/%u\n",
++			 attempt, EN75_MT7530_REAPPLY_MAX);
++
++	eth->mt7530_reapply_count++;
++	if (eth->mt7530_reapply_count < EN75_MT7530_REAPPLY_MAX)
++		schedule_delayed_work(&eth->mt7530_reapply_work,
++			msecs_to_jiffies(en75_ext_switch_reapply_delay_ms(
++				eth->mt7530_reapply_count)));
++}
++
++static void en75_ext_switch_schedule_reapply(struct en75_eth_pvt *eth)
++{
++	if (!of_property_read_bool(eth->pub.dev->of_node,
++				   "econet,mt7530-vlan-split"))
++		return;
++
++	eth->mt7530_reapply_count = 0;
++	schedule_delayed_work(&eth->mt7530_reapply_work,
++		msecs_to_jiffies(en75_ext_switch_reapply_delay_ms(0)));
++}
++
+ static struct net_device *en75_get_sport_dev(struct en75_eth_pvt *eth,
+ 					     enum etx_fport sport)
+ {
+@@ -672,6 +725,8 @@
+ 	if (!eth)
+ 		return;
+ 
++	cancel_delayed_work_sync(&eth->mt7530_reapply_work);
++
+ 	en75_debugfs_exit(eth->debug);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+@@ -708,6 +763,8 @@
+ 
+ 	eth->pub.dev = &pdev->dev;
+ 	platform_set_drvdata(pdev, eth);
++	INIT_DELAYED_WORK(&eth->mt7530_reapply_work,
++			  en75_ext_switch_reapply_work);
+ 
+ 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+ 	if (err)
+@@ -789,6 +846,8 @@
+ 	if (err)
+ 		goto error;
+ 
++	en75_ext_switch_schedule_reapply(eth);
++
+ 	return 0;
+ 
+ error:

@@ -1,0 +1,137 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: bind at the engine's learned slot, not the descriptor hash
+
+Hardware evidence (FOE dump during traffic): the table is shared correctly
+(TB_BASE ok) - the engine writes UNBIND entries and we write BIND entries into
+the same table. But our BIND entries sit with frozen timestamps and are never
+hit, while the engine keeps reporting HIT_UNBIND / HIT_UNBIND_RATE_REACHED
+(crsn 0x0e/0x0f dominant, 0x16 never): it finds its own UNBIND entry at the
+real hash slot and asks us to bind it, but our BIND was written at the
+descriptor-reported "ppe_entry" slot, which is NOT the engine's search slot on
+this SoC (the same flow was observed bound at two different slots, and the SW
+hash mtk_ppe_hash_entry reproduces neither).
+
+The engine already auto-learned (FORWARD_BUILD) an UNBIND entry with the exact
+ingress tuple at the true hash slot. So on the bind signal, scan the live FOE
+table for the UNBIND entry matching the staged flow's tuple and commit our
+prebuilt BIND entry at that slot instead of the descriptor hash. Stay PENDING
+until the engine has learned the entry, so we never bind at a wrong slot.
+
+diff -ruN b128/econet_ppe_offload.c b129/econet_ppe_offload.c
+--- a/econet_ppe_offload.c	2026-06-29 20:33:25.726171224 +0300
++++ b/econet_ppe_offload.c	2026-06-29 20:35:07.436649122 +0300
+@@ -521,6 +521,59 @@
+ 	return 0;
+ }
+ 
++/*
++ * Find the slot where the engine auto-learned (FORWARD_BUILD) an UNBIND entry
++ * for this flow. The descriptor-reported hash is not the engine's real search
++ * slot on this SoC, so committing there never hits; the engine keeps its own
++ * UNBIND entry at the true hash slot and asks us to bind it (crsn 0x0e/0x0f).
++ * Scan for that entry by matching the ingress tuple, and bind it in place.
++ * @want is host byte order; the live table is little-endian.
++ */
++static int en75_ppe_find_engine_slot(struct en75_ppe *ppe,
++				     const struct en75_foe_entry *want)
++{
++	u32 type = FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, want->ib1);
++	u32 i;
++
++	for (i = 0; i < EN75_PPE_ENTRIES; i++) {
++		u32 ib1 = le32_to_cpu(READ_ONCE(ppe->foe[i].ib1));
++
++		if (FIELD_GET(EN75_FOE_IB1_STATE, ib1) != EN75_FOE_STATE_UNBIND)
++			continue;
++		if (FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1) != type)
++			continue;
++
++		if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT ||
++		    type == EN75_PPE_PKT_TYPE_IPV4_ROUTE) {
++			const struct en75_ipv4_tuple *w = &want->ipv4.orig;
++			const struct en75_ipv4_tuple *h = &ppe->foe[i].ipv4.orig;
++
++			if (le32_to_cpu(h->src_ip)  == w->src_ip &&
++			    le32_to_cpu(h->dest_ip) == w->dest_ip &&
++			    le32_to_cpu(h->ports)   == w->ports)
++				return i;
++		} else if (type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T ||
++			   type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++			const struct en75_foe_ipv6 *w = &want->ipv6;
++			const struct en75_foe_ipv6 *h = &ppe->foe[i].ipv6;
++			bool ok = true;
++			int j;
++
++			for (j = 0; j < 4; j++)
++				if (le32_to_cpu(h->src_ip[j])  != w->src_ip[j] ||
++				    le32_to_cpu(h->dest_ip[j]) != w->dest_ip[j])
++					ok = false;
++			if (type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T &&
++			    le32_to_cpu(h->ports) != w->ports)
++				ok = false;
++			if (ok)
++				return i;
++		}
++	}
++
++	return -1;
++}
++
+ void en75_ppe_offload_rx_commit(struct en75_ppe *ppe, struct sk_buff *skb,
+ 				u32 hw_slot)
+ {
+@@ -543,39 +596,22 @@
+ 	if (entry) {
+ 		spin_lock_irqsave(&ppe->foe_lock, flags);
+ 		if (entry->state == EN75_FLOW_PENDING) {
+-			static atomic_t cdbg = ATOMIC_INIT(8);
+-			static atomic_t hdbg = ATOMIC_INIT(12);
+-			struct en75_foe_entry e = entry->foe;
+-
+-			/* DIAGNOSTIC: does our SW hash match the slot the hardware
+-			 * reported? If not, the descriptor "ppe_entry" is not the
+-			 * FOE search slot and we commit to the wrong place. */
+-			if (atomic_dec_if_positive(&hdbg) >= 0) {
+-				u32 sw = en75_foe_entry_hash(&entry->foe);
+-
+-				pr_info("econet-eth: commit hw_slot=%u sw_hash=%u%s\n",
+-					hw_slot, sw,
+-					sw == hw_slot ? "" : " HASH-DIFF");
+-			}
++			int slot = en75_ppe_find_engine_slot(ppe, &entry->foe);
+ 
+-			e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
+-			e.ib1 |= FIELD_PREP(EN75_FOE_IB1_STATE, EN75_FOE_STATE_BIND);
+-			e.ib1 |= en75_ppe_timestamp(ppe);
+-			__en75_ppe_foe_commit(ppe, hw_slot, &e);
+-			entry->hash = hw_slot;
+-			entry->state = EN75_FLOW_COMMITTED;
+-			if (atomic_dec_if_positive(&cdbg) >= 0) {
+-				struct en75_ipv4_tuple *o = &e.ipv4.orig;
+-				struct en75_ipv4_tuple *n = &e.ipv4.new;
+-
+-				pr_info("econet-eth: PPE commit hw_slot=%u skb %pI4:%u->%pI4:%u "
+-					"orig %08x/%08x/%08x new %08x/%08x/%08x ib2=%08x\n",
+-					hw_slot,
+-					&key.src[0], ntohs(key.sport),
+-					&key.dst[0], ntohs(key.dport),
+-					o->src_ip, o->dest_ip, o->ports,
+-					n->src_ip, n->dest_ip, n->ports,
+-					e.ipv4.ib2);
++			/* Stay PENDING until the engine has auto-learned this
++			 * flow's UNBIND entry; then bind our prebuilt entry at
++			 * that exact slot - the one the engine actually searches. */
++			if (slot >= 0) {
++				struct en75_foe_entry e = entry->foe;
++
++				e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
++				e.ib1 |= FIELD_PREP(EN75_FOE_IB1_STATE, EN75_FOE_STATE_BIND);
++				e.ib1 |= en75_ppe_timestamp(ppe);
++				__en75_ppe_foe_commit(ppe, slot, &e);
++				entry->hash = slot;
++				entry->state = EN75_FLOW_COMMITTED;
++				pr_info_ratelimited("econet-eth: PPE bound flow at engine slot %u (hw_slot was %u)\n",
++						    slot, hw_slot);
+ 			}
+ 		} else if (entry->state == EN75_FLOW_COMMITTED) {
+ 			static atomic_t dbg = ATOMIC_INIT(32);

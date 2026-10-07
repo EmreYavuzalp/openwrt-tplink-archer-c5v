@@ -1,0 +1,60 @@
+From: OpenAI Codex <codex@local>
+Subject: econet-eth: include TRGMII resync in delayed MT7530 reapply
+
+Reboot testing on Archer C5v still showed occasional wired Ethernet loss after
+the initial TRGMII resync. The delayed work previously only re-applied the
+external MT7530 VLAN/port table, which does not recover a dead TRGMII data path
+when registers already read back correctly.
+
+Run the TRGMII pad resync before each delayed VLAN split reapply and extend the
+retry window to 2s, 10s, 30s, 60s and 120s. Both operations are idempotent for
+the C5v VLAN-split path and keep the existing topology unchanged.
+---
+--- a/econet_eth.c	2026-06-26 09:44:46.860293168 +0300
++++ b/econet_eth.c	2026-06-26 09:45:47.892737025 +0300
+@@ -702,7 +702,7 @@
+ 	return 0;
+ }
+ 
+-#define EN75_MT7530_REAPPLY_MAX	3
++#define EN75_MT7530_REAPPLY_MAX	5
+ 
+ static unsigned int en75_ext_switch_reapply_delay_ms(unsigned int attempt)
+ {
+@@ -711,8 +711,12 @@
+ 		return 2000;
+ 	case 1:
+ 		return 10000;
+-	default:
++	case 2:
+ 		return 30000;
++	case 3:
++		return 60000;
++	default:
++		return 120000;
+ 	}
+ }
+ 
+@@ -724,14 +728,20 @@
+ 	unsigned int attempt = eth->mt7530_reapply_count + 1;
+ 	int err;
+ 
++	err = en75_trgmii_resync(eth);
++	if (err)
++		dev_warn(eth->pub.dev,
++			 "failed to re-sync MT7530 TRGMII path attempt %u: %d\n",
++			 attempt, err);
++
+ 	err = en75_ext_switch_configure_vlan_split(eth);
+ 	if (err)
+ 		dev_warn(eth->pub.dev,
+-			 "failed to re-apply external MT7530 VLAN split attempt %u: %d\n",
++			 "failed to re-apply external MT7530 TRGMII/VLAN split attempt %u: %d\n",
+ 			 attempt, err);
+ 	else
+ 		dev_info(eth->pub.dev,
+-			 "re-applied external MT7530 VLAN split attempt %u/%u\n",
++			 "re-applied external MT7530 TRGMII/VLAN split attempt %u/%u\n",
+ 			 attempt, EN75_MT7530_REAPPLY_MAX);
+ 
+ 	eth->mt7530_reapply_count++;

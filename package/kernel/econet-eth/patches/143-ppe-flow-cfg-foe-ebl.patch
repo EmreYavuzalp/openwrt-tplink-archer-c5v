@@ -1,0 +1,70 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: set FLOW_CFG FOE_EBL/bit15 and DFP_CPORT=0x500 (vendor match)
+
+The engine's search+hash+punt path works (per-packet crsn with the correct
+slot), and we commit valid BIND entries at the reverse-engineered hash slot
+with correct L2, but the engine never *hits/forwards* those bound entries
+(0x16 stays 0, 0d climbs, PPE is net-negative vs the software flowtable).
+
+Static diff against the Airoha vendor blob (hw_nat.ko) shows two register
+writes our bring-up is missing:
+
+  * FLOW_CFG (0x204): every vendor write (PpeParseLayerInfo 0x0003f3c0 /
+    0x0003b7c0) sets bit15 and bit16. PpeSetFoeEbl masks the register down to
+    *only* bit16 before writing it back, which proves bit16 is the FOE-lookup
+    "engine enable" (bind-hit -> forward). We set neither; adding both is the
+    single most likely reason bound flows are searched+punted but never
+    forwarded.
+  * DFP_CPORT (0x248): vendor writes 0x500 from three independent paths; we
+    wrote 0.
+
+Set FLOW_CFG |= bit15|bit16 and DFP_CPORT = 0x500 in en75_ppe_start().
+
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -46,6 +46,16 @@
+ #define EN75_PPE_FLOW_CFG_IP4_NAT		BIT(12)
+ #define EN75_PPE_FLOW_CFG_IP4_NAPT		BIT(13)
+ #define EN75_PPE_FLOW_CFG_IP4_DSLITE		BIT(14)
++/*
++ * Vendor (Airoha hw_nat) sets bit15 and bit16 in every FLOW_CFG write and in
++ * PpeSetFoeEbl (which masks the register down to *only* bit16 before writing,
++ * proving bit16 is the FOE-lookup / bind-hit "engine enable"). Mainline mtk
++ * never sets these because its netsys enables the engine differently; on
++ * EN751221 the search+punt path works without them but bound entries are never
++ * hit/forwarded until both are set. bit15 is always set alongside bit16.
++ */
++#define EN75_PPE_FLOW_CFG_UDP_IP4		BIT(15)
++#define EN75_PPE_FLOW_CFG_FOE_EBL		BIT(16)
+ #define EN75_PPE_FLOW_CFG_IP4_NAT_FRAG		BIT(17)
+ 
+ #define EN75_PPE_IP_PROTO_CHK		0x208
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -404,7 +404,9 @@
+ 	      EN75_PPE_FLOW_CFG_IP4_DSLITE |
+ 	      EN75_PPE_FLOW_CFG_IP4_NAT_FRAG |
+ 	      EN75_PPE_FLOW_CFG_IP4_TCP_FRAG |
+-	      EN75_PPE_FLOW_CFG_IP4_UDP_FRAG;
++	      EN75_PPE_FLOW_CFG_IP4_UDP_FRAG |
++	      EN75_PPE_FLOW_CFG_UDP_IP4 |
++	      EN75_PPE_FLOW_CFG_FOE_EBL;
+ 	ppe_w32(ppe, EN75_PPE_FLOW_CFG, val);
+ 
+ 	val = FIELD_PREP(EN75_PPE_UNBIND_AGE_MIN_PACKETS, 1000) |
+@@ -436,8 +438,13 @@
+ 	      EN75_PPE_GLO_CFG_FLOW_DROP_UPDATE;
+ 	ppe_w32(ppe, EN75_PPE_GLO_CFG, val);
+ 
+-	/* Default CPU port for punted (unbound / miss) traffic. */
+-	ppe_w32(ppe, EN75_PPE_DEFAULT_CPU_PORT, 0);
++	/*
++	 * Default CPU port for punted (unbound / miss) traffic. Vendor writes
++	 * 0x500 here from three separate code paths (SetGdmaFwd / force-port);
++	 * we previously wrote 0, which also selected the CPU but did not match
++	 * the vendor's PSE egress port encoding used when a bound flow hits.
++	 */
++	ppe_w32(ppe, EN75_PPE_DEFAULT_CPU_PORT, 0x500);
+ 
+ 	ppe_wait_busy(ppe);
+ 

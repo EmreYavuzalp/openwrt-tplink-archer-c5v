@@ -1,0 +1,130 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: parse PPPoE in the RX bind hint + diagnose commit outcomes
+
+With both offloads on, conntrack showed HW_OFFLOAD=126 yet the FOE table held
+zero driver IPv4 binds (only the engine's own ipv6 auto-binds) and crsn 0f
+exploded to ~160k/5s under a download test - the engine kept begging for a
+bind that never landed. Root cause: the WAN is PPPoE, so the reply (download)
+direction - the bulk of the traffic - arrives as VLAN35 + PPPoE + IP. The RX
+bind-hint tuple parser only understood 0x0800/0x86dd, so it could not extract
+the inner 5-tuple, the staged reply entry was never matched, and the flow
+never bound. (The orig/upload direction is sparse ACKs that mostly punt as
+0x0d UN_HIT and rarely reach the 0x0e/0x0f commit path, so it bound ~never too,
+hence zero total binds.)
+
+Decapsulate PPPoE session frames (6-byte session header + 2-byte PPP proto)
+before reading the IP header, matching the decapsulated tuple the engine and
+the flowtable key both use. Also add per-outcome counters to the RX commit,
+printed every 5s, so the next run shows exactly where any remaining hints are
+lost (parse / lookup / backoff / slot).
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -152,6 +152,26 @@
+ 		l2 += VLAN_HLEN;
+ 	}
+ 
++	/* PPPoE session frames (WAN side): a 6-byte session header followed by a
++	 * 2-byte PPP protocol id, then the inner IP packet. The engine parses
++	 * these and learns the inner 5-tuple, so the staged reply-direction entry
++	 * is keyed on the *decapsulated* tuple. Without this the download (reply)
++	 * direction never matches and never binds, which is the bulk of traffic. */
++	if (proto == htons(ETH_P_PPP_SES)) {
++		__be16 ppp;
++
++		if (skb->len < l2 + 8)
++			return;
++		ppp = *(const __be16 *)(data + l2 + 6);
++		l2 += 8;
++		if (ppp == htons(0x0021))		/* PPP_IP */
++			proto = htons(ETH_P_IP);
++		else if (ppp == htons(0x0057))		/* PPP_IPV6 */
++			proto = htons(ETH_P_IPV6);
++		else
++			return;
++	}
++
+ 	if (proto == htons(ETH_P_IP)) {
+ 		const struct iphdr *iph = (const struct iphdr *)(data + l2);
+ 		const __be16 *ports;
+@@ -620,32 +640,48 @@
+ 	struct en75_flow_entry *entry;
+ 	struct en75_flow_tuple key;
+ 	unsigned long flags;
++	/* DIAGNOSTIC: where do the RX bind hints go? Printed every 5s so a
++	 * many-flow test shows whether commits fail at tuple-parse (PPPoE/encap),
++	 * lookup (flow not staged), backoff, or slot resolution. */
++	static u32 d_call, d_noparse, d_nolk, d_notpend, d_backoff, d_noslot, d_bound;
++	static unsigned long d_last;
+ 
+ 	if (IS_ERR_OR_NULL(ppe) || !ppe->tuple_table_ready)
+ 		return;
+ 	if (hw_slot >= EN75_PPE_ENTRIES)
+ 		return;
+ 
++	d_call++;
++
+ 	en75_flow_tuple_from_skb(&key, skb);
+-	if (!key.l4proto)
+-		return;
++	if (!key.l4proto) {
++		d_noparse++;
++		goto out_log;
++	}
+ 
+ 	rcu_read_lock();
+ 	entry = rhashtable_lookup(&ppe->tuple_table, &key,
+ 				  en75_tuple_ht_params);
+-	if (entry && READ_ONCE(entry->state) == EN75_FLOW_PENDING &&
+-	    !time_before(jiffies, READ_ONCE(entry->last_scan) + EN75_PPE_SCAN_BACKOFF)) {
++	if (!entry) {
++		d_nolk++;
++	} else if (READ_ONCE(entry->state) != EN75_FLOW_PENDING) {
++		d_notpend++;
++	} else if (time_before(jiffies,
++			       READ_ONCE(entry->last_scan) + EN75_PPE_SCAN_BACKOFF)) {
++		d_backoff++;
++	} else {
+ 		int slot;
+ 
+ 		WRITE_ONCE(entry->last_scan, jiffies);
+ 
+-		/* Find the slot where the engine auto-learned this flow's UNBIND
+-		 * entry. Scan lockless: it is 16384 uncached reads, and holding
+-		 * foe_lock (IRQ-off) across it blocked NAPI long enough to drop
+-		 * packets and collapse TCP. The commit below re-checks the state
+-		 * under the lock, so a racy read here only risks a retry. */
++		/* Resolve the slot the engine searches for this flow (O(1) from
++		 * the descriptor; full scan only as a fallback). The commit below
++		 * re-checks the state under the lock, so a racy read only risks a
++		 * retry. */
+ 		slot = en75_ppe_find_engine_slot(ppe, &entry->foe, hw_slot);
+-		if (slot >= 0) {
++		if (slot < 0) {
++			d_noslot++;
++		} else {
+ 			spin_lock_irqsave(&ppe->foe_lock, flags);
+ 			if (entry->state == EN75_FLOW_PENDING) {
+ 				struct en75_foe_entry e = entry->foe;
+@@ -656,6 +692,7 @@
+ 				__en75_ppe_foe_commit(ppe, slot, &e);
+ 				entry->hash = slot;
+ 				entry->state = EN75_FLOW_COMMITTED;
++				d_bound++;
+ 				pr_info_ratelimited("econet-eth: PPE bound flow at engine slot %u (hw_slot was %u)\n",
+ 						    slot, hw_slot);
+ 			}
+@@ -663,6 +700,13 @@
+ 		}
+ 	}
+ 	rcu_read_unlock();
++
++out_log:
++	if (!d_last || time_after(jiffies, d_last + 5 * HZ)) {
++		d_last = jiffies;
++		pr_info("econet-eth: rxc call=%u noparse=%u nolk=%u notpend=%u backoff=%u noslot=%u bound=%u\n",
++			d_call, d_noparse, d_nolk, d_notpend, d_backoff, d_noslot, d_bound);
++	}
+ }
+ 
+ static DEFINE_MUTEX(en75_flow_offload_mutex);

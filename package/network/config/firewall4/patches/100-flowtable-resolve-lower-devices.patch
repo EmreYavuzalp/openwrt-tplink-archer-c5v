@@ -1,0 +1,47 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: fw4: resolve lower devices for vlan/bridge without netifd devtype
+
+On the econet target the eth0.X vlan subdevices are kernel 8021q devices
+netifd does not report a devtype for, so resolve_hw_offload_devices kept
+eth0.1/eth0.35 in the flowtable instead of descending to eth0. The kernel's
+nft_dev_forward_path() requires the fully resolved lower device (eth0) to be
+a flowtable member; without it both flow directions fall back to XMIT_NEIGH,
+the PPPoE direction gets all-zero L2 and VLAN/PPPoE encap actions are never
+generated, so PPE hardware offload cannot bind those flows. Fall back to the
+sysfs uevent DEVTYPE when netifd has no devtype for the device.
+
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -423,12 +423,31 @@
+ 	return fields;
+ }
+ 
++function sysfs_devtype(devname) {
++	let fd = fs.open(`/sys/class/net/${devname}/uevent`, "r");
++	let devtype = null;
++
++	if (fd) {
++		let line;
++		while (length(line = fd.read("line"))) {
++			let m = match(line, /^DEVTYPE=(.+)\n?$/);
++			if (m) {
++				devtype = m[1];
++				break;
++			}
++		}
++		fd.close();
++	}
++
++	return devtype;
++}
++
+ function resolve_lower_devices(devstatus, devname) {
+ 	let dir = fs.opendir(`/sys/class/net/${devname}`);
+ 	let devs = [];
+ 
+ 	if (dir) {
+-		switch (devstatus[devname]?.devtype) {
++		switch (devstatus[devname]?.devtype ?? sysfs_devtype(devname)) {
+ 		case 'vlan':
+ 		case 'bridge':
+ 			let e;

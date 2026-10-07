@@ -1,0 +1,5 @@
+#!/bin/sh
+# İlk boot'ta LED durum daemon'unu etkinleştir (firmware'e gömülü, otomatik başlar).
+/etc/init.d/led-status enable
+/etc/init.d/led-status start
+exit 0

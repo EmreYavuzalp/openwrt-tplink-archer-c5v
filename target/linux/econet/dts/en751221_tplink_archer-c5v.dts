@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+#include "en751221.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+/ {
+	model = "TP-Link Archer C5v";
+	compatible = "tplink,archer-c5v", "econet,en751221";
+
+	aliases {
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		/*
+		 * GPIO haritası gpio-probe.sh ile cihazda doğrulandı (2026-07-14).
+		 * Tümü ACTIVE_LOW varsayıldı (TP-Link konvansiyonu); flash sonrası
+		 * ters yanan olursa GPIO_ACTIVE_HIGH'a çevir.
+		 * Wi-Fi 2.4G/5G LED'leri burada YOK — onlar SoC GPIO değil, mt76
+		 * wifi çipinin LED pininde (ayrı iş, mt76 DTS özellikleri).
+		 */
+		led_power: power {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_POWER;
+			gpios = <&gpio0 26 GPIO_ACTIVE_LOW>;
+		};
+
+		led_wan: wan {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_WAN;
+			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
+		};
+
+		/* Internet LED çift renkli: internet VAR=mavi, YOK=kırmızı.
+		 * Geçişi userspace sürer (internet-led.sh, /etc/hotplug.d/iface). */
+		led_internet_blue: internet-blue {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_WAN_ONLINE;
+			gpios = <&gpio0 24 GPIO_ACTIVE_LOW>;
+		};
+
+		led_internet_red: internet-red {
+			color = <LED_COLOR_ID_RED>;
+			function = LED_FUNCTION_WAN;
+			gpios = <&gpio0 23 GPIO_ACTIVE_LOW>;
+		};
+
+		led_wps: wps {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_WPS;
+			gpios = <&gpio0 25 GPIO_ACTIVE_LOW>;
+		};
+
+		led_usb: usb {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_USB;
+			gpios = <&gpio0 29 GPIO_ACTIVE_LOW>;
+			/* usbport trigger'ı flash sonrası uci ile eklenebilir */
+		};
+
+		led_phone1: phone1 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = "phone";
+			function-enumerator = <1>;
+			gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
+		};
+
+		led_phone2: phone2 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = "phone";
+			function-enumerator = <2>;
+			gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
+
+		/*
+		 * Buton GPIO'ları + polariteleri cihazda DOĞRULANDI (2026-07-15):
+		 *   reset: gpio0 0,  ACTIVE_LOW  (boşta HIGH, kararlı)
+		 *   wifi:  gpio0 19, ACTIVE_HIGH (boşta LOW, kararlı) -- KALDIRILDI, aşağı bak
+		 * reset active-low, wifi active-high.
+		 *
+		 * WPS (gpio0 3) KALDIRILDI (2026-08-09): pin FLOATING okuyor (boşta
+		 * kararsız hi/lo; 10 örnekte ~1 kez hayalet 'hi'). ACTIVE_HIGH tanımlı
+		 * olduğundan bu hayalet 'hi' = sahte KEY_WPS_BUTTON basımı. Preinit
+		 * failsafe penceresine denk gelen HERHANGİ bir buton basımı
+		 * /etc/rc.button/failsafe -> /tmp/failsafe_button yazıp cihazı ARALIKLI
+		 * olarak FAILSAFE'e düşürüyordu (seri gerekmeden, açılışta rastgele).
+		 * WPS butonu işlevsel gereksinim değil; pin güvenilir olmadığı için
+		 * tamamen çıkarıldı. Tekrar isteniyorsa donanımda kararlı pull gerekir.
+		 *
+		 * WiFi (gpio0 19, KEY_RFKILL) KALDIRILDI (2026-08-09): buton kararlı
+		 * (floating değil) ama /etc/rc.button/rfkill wifi'yi kapatırken
+		 * `uci commit wireless` yapıyor -> tek yanlışlıkla basış WiFi'yi KALICI
+		 * kapatıyor (reboot'ta da kapalı; müşteri "internetim gitti" der).
+		 * Müşteri ürünü için kaza-korumalı olsun diye butonu devre dışı bıraktık.
+		 * Geri istenirse aşağıdaki key-wifi node'unun yorumunu kaldır (donanımda
+		 * pin kararlı: boşta gpio0 19 = LOW).
+		 */
+		key-reset {
+			label = "reset";
+			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+
+		/* Geri açmak için yorumu kaldır (bkz. yukarıdaki not):
+		key-wifi {
+			label = "wifi";
+			gpios = <&gpio0 19 GPIO_ACTIVE_HIGH>;
+			linux,code = <KEY_RFKILL>;
+		};
+		*/
+	};
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x8000000>;
+	};
+	chosen {
+		stdout-path = "/serial@1fbf0000:115200";
+		linux,usable-memory-range = <0x00020000 0x07fe0000>;
+		bootargs = "ubi.mtd=ubi";
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* Crash log storage surviving warm reboots (pstore/ramoops).
+		 * Top 256 KiB of the 128 MiB DRAM: 4x32K oops/panic dumps,
+		 * 96K console ring, 32K pmsg.
+		 */
+		ramoops@7fc0000 {
+			compatible = "ramoops";
+			reg = <0x07fc0000 0x40000>;
+			record-size = <0x8000>;
+			console-size = <0x18000>;
+			pmsg-size = <0x8000>;
+		};
+	};
+};
+&nand {
+	status = "okay";
+	econet,bmt;
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/*
+		 * UBI layout. The vendor bootloader reads the kernel slot raw from
+		 * 0x20000 (TP-Link v2 header + LZMA kernel), so the kernel stays a
+		 * plain BMT partition. Everything from 0x420000 up to romfile is a
+		 * single UBI partition holding the squashfs rootfs + ubifs overlay
+		 * volumes; the stock second slot (kernel_2/rootfs_2) is folded into
+		 * it. The UBI partition deliberately has no econet,enable-remap so
+		 * UBI does its own bad-block management; en75_bmt (econet,bmt) only
+		 * applies the existing factory bad-block map, which is safe here.
+		 *
+		 *   0x000000-0x020000  boot
+		 *   0x020000-0x420000  kernel  (4 MB, raw, tplink-v2-header + LZMA)
+		 *   0x420000-0x6420000 ubi     (96 MB)
+		 *   0x6420000-0x6440000 romfile
+		 *   0x6440000-0x6460000 config
+		 *   0x6460000-0x6480000 radio  (Wi-Fi calibration)
+		 *   0x6480000-0x7340000 reserve_area (holds the BMT)
+		 */
+		partition@0 {
+			label = "boot";
+			reg = <0x0 0x20000>;
+			read-only;
+		};
+
+		partition@20000 {
+			label = "kernel";
+			reg = <0x20000 0x400000>;
+		};
+
+		partition@420000 {
+			label = "ubi";
+			reg = <0x420000 0x6000000>;
+		};
+
+		partition@6420000 {
+			label = "romfile";
+			reg = <0x6420000 0x20000>;
+			read-only;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/* Base MAC; the label MAC (LAN) is base + 2. */
+				macaddr_romfile_f100: macaddr@f100 {
+					compatible = "mac-base";
+					reg = <0xf100 0x6>;
+					#nvmem-cell-cells = <1>;
+				};
+			};
+		};
+
+		partition@6440000 {
+			label = "config";
+			reg = <0x6440000 0x20000>;
+		};
+
+		radio: partition@6460000 {
+			label = "radio";
+			reg = <0x6460000 0x20000>;
+			read-only;
+		};
+
+		partition@6480000 {
+			label = "reserve_area";
+			reg = <0x6480000 0xec0000>;
+			read-only;
+		};
+	};
+};
+&gmac0 {
+	status = "okay";
+	nvmem-cells = <&macaddr_romfile_f100 2>;
+	nvmem-cell-names = "mac-address";
+};
+
+&ethernet {
+	econet,mt7530-vlan-split;
+	econet,mt7530-cpu-port = <6>;
+	econet,mt7530-lan-ports = <0 1 2 3>;
+	econet,mt7530-lan-vid = <1>;
+	econet,mt7530-wan-port = <4>;
+	econet,mt7530-wan-vid = <35>;
+};
+&pcie0 {
+	status = "okay";
+};
+&pcie1 {
+	status = "okay";
+};
+
+/* MT7592N 2.4 GHz (mt7603e), calibration at radio partition offset 0x0 */
+&slot0 {
+	wifi@0,0 {
+		compatible = "mediatek,mt76";
+		reg = <0x0000 0 0 0 0>;
+		mediatek,mtd-eeprom = <&radio 0x0>;
+		nvmem-cells = <&macaddr_romfile_f100 0>;
+		nvmem-cell-names = "mac-address";
+
+		/* Front-panel 2.4 GHz LED: mt7603 chip LED pin 0 (default),
+		 * active-low (test: brightness=255 söndürdü, 0 yaktı = ters).
+		 * mt76-phy0 registration için mt76 patch 004 (subdir LED define)
+		 * gerekti. */
+		led {
+			led-active-low;
+		};
+	};
+};
+
+/* MT7612EN 5 GHz (mt76x2e), calibration at radio partition offset 0x8000 */
+&slot1 {
+	wifi@0,0 {
+		compatible = "mediatek,mt76";
+		reg = <0x0000 0 0 0 0>;
+		mediatek,mtd-eeprom = <&radio 0x8000>;
+		nvmem-cells = <&macaddr_romfile_f100 1>;
+		nvmem-cell-names = "mac-address";
+
+		/* Front-panel 5 GHz LED: mt76x2 chip LED pin 2, active-low
+		 * (bulundu: wifi-led-regtest.sh, pin2 + POLARITY yaktı). */
+		led {
+			led-sources = <2>;
+			led-active-low;
+		};
+	};
+};

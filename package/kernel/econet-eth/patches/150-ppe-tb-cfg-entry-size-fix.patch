@@ -1,0 +1,53 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: TB_CFG bit16 is entry-size select, not scan mode - fix 80B mode
+
+Root cause of "BIND committed but the engine never hits it" (crsn stuck at
+0d/0e/0f, 16 always 0): the FOE entry STRIDE the engine walks did not match
+the 80-byte layout the driver writes.
+
+Live proof (patch 149 BINDDBG, 8/8 dumps): the engine's own learned UNBIND
+entries always start at 64-byte-aligned table offsets, i.e. the engine was
+walking the table with a 64-byte stride while the driver reads/writes 80-byte
+slots. Every driver BIND landed at bytes the engine never searches.
+
+Vendor hw_nat.ko (EN751221-Linux26 SDK, chip check reads 0xbfb00064; live
+value on the Archer C5v is 0x00070000) programs the entry size for chip
+families 0x0007/0x0008 as a TWO-bit selection spread over TB_CFG bit16 and
+bit3 (RegModifyBits sequences in PpeInitMod, gPpeType 1/2/3 with
+gPpeFoeSize 32/64/80):
+
+    gPpeType  size  bit16  bit3
+       1      32B     1     0
+       2      64B     0     0
+       3      80B     0     1
+
+Our init wrote bit3=1 (ENTRY_80B, correct) but ALSO bit16=1 via
+FIELD_PREP(SCAN_MODE[17:16], 1) copied from the mtk netsys register map.
+On EN751221 bit16 is NOT a scan-mode field - it is the other half of the
+entry-size select. bit16=1 + bit3=1 is an illegal combination which the
+engine resolved to a 64-byte stride.
+
+Drop the bogus SCAN_MODE field so bit16 stays 0: with bit16=0/bit3=1 the
+engine walks genuine 80-byte entries, aligned with the driver's layout,
+hash slot computation and bind writes.
+
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -432,10 +432,15 @@ void en75_ppe_start(struct en75_ppe *ppe
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_KEEPALIVE,
+ 			 EN75_PPE_KEEPALIVE_DISABLE) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_HASH_MODE, 1) |
+-	      FIELD_PREP(EN75_PPE_TB_CFG_SCAN_MODE,
+-			 EN75_PPE_SCAN_MODE_CHECK_AGE) |
++	      /* Do NOT set bit16: unlike mtk netsys there is no SCAN_MODE
++	       * field at [17:16] on EN751221. Vendor hw_nat programs the FOE
++	       * entry size as bit16/bit3 = 1/0 (32B), 0/0 (64B), 0/1 (80B).
++	       * Setting bit16 together with ENTRY_80B made the engine walk the
++	       * table with a 64-byte stride while the driver wrote 80-byte
++	       * slots, so driver BINDs were never hit (only 0d/0e/0f, no 16).
++	       */
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_ENTRY_NUM, EN75_PPE_ENTRIES_SHIFT) |
+ 	      EN75_PPE_TB_CFG_ENTRY_80B;
+ 	ppe_w32(ppe, EN75_PPE_TB_CFG, val);
+
+ 	ppe_w32(ppe, EN75_PPE_IP_PROTO_CHK,

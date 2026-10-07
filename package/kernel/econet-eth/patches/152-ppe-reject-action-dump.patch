@@ -1,0 +1,43 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: dump the full action list when the L2 rewrite comes out invalid
+
+About half of the offloaded flows still reject with -EINVAL because data.eth
+stays zero after the action walk (L2DIAG all-zero). Before fixing the decode,
+capture exactly what nf_flow_table_offload put in those rules: on the invalid
+path, re-walk the action list and print id/htype/offset/mask/val for each
+entry (first 24 rejected rules per boot).
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -386,12 +386,28 @@
+ 		}
+ 	}
+ 
+-	pr_info_ratelimited("econet-eth: L2DIAG dst=%pM src=%pM\n",
+-			    data.eth.h_dest, data.eth.h_source);
+-
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+-	    !is_valid_ether_addr(data.eth.h_dest))
++	    !is_valid_ether_addr(data.eth.h_dest)) {
++		static atomic_t rejdumps = ATOMIC_INIT(0);
++
++		if (atomic_inc_return(&rejdumps) <= 24) {
++			pr_info("econet-eth: ACTDBG reject dst=%pM src=%pM vlans=%d pppoe=%d\n",
++				data.eth.h_dest, data.eth.h_source,
++				data.vlan.num, data.pppoe.num);
++			flow_action_for_each(i, act, &rule->action) {
++				if (act->id == FLOW_ACTION_MANGLE)
++					pr_info("econet-eth: ACTDBG [%d] MANGLE htype=%d off=%u mask=%08x val=%08x\n",
++						i, act->mangle.htype,
++						act->mangle.offset,
++						act->mangle.mask,
++						act->mangle.val);
++				else
++					pr_info("econet-eth: ACTDBG [%d] id=%d\n",
++						i, act->id);
++			}
++		}
+ 		return -EINVAL;
++	}
+ 
+ 	/* Milestone 2b-3a forces the egress to the CPU: the entry is fully
+ 	 * built (incl. the L2 rewrite from the eth mangle actions) but the

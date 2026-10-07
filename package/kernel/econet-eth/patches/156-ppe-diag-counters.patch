@@ -1,0 +1,295 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: add silent diagnostic counters for the offload path
+
+IPv6 flows never bind to the PPE: the engine learns matching UNBIND
+5-tuple entries with the exact layout our builder produces (verified on
+hardware via devmem), the staged rules get [HW_OFFLOAD], yet bind stays
+flat while IPv4 binds fine. The old bring-up instrumentation was printk
+based and has been removed; this adds a zero-cost, printk-free
+replacement to pin down where the v6 chain stops:
+
+- per-stage rx-commit counters, v4/v6 split for lookup-miss / no-slot /
+  bound,
+- per-reason accept/reject counters in flow replace, v4/v6 split for
+  accepts,
+- an RX crsn histogram (counter only),
+
+all dumped by the new debugfs file econet_ppe/diag. No behavioural
+change.
+--- a/econet_ppe.h	2026-07-03 14:38:20.600546847 +0300
++++ b/econet_ppe.h	2026-07-03 14:38:20.624545559 +0300
+@@ -147,6 +147,31 @@
+ /** Per-PPE runtime state. */
+ struct flow_cls_offload;
+ 
++/* Bring-up diagnostic counters, dumped by debugfs econet_ppe/diag. Plain
++ * u32s: increments race harmlessly, this is inspection-only. */
++enum en75_diag_id {
++	EN75_DIAG_RXC_CALL,
++	EN75_DIAG_RXC_NOPARSE,
++	EN75_DIAG_RXC_NOLK4,
++	EN75_DIAG_RXC_NOLK6,
++	EN75_DIAG_RXC_NOTPEND,
++	EN75_DIAG_RXC_BACKOFF,
++	EN75_DIAG_RXC_NOSLOT4,
++	EN75_DIAG_RXC_NOSLOT6,
++	EN75_DIAG_RXC_BOUND4,
++	EN75_DIAG_RXC_BOUND6,
++	EN75_DIAG_REPL_OK4,
++	EN75_DIAG_REPL_OK6,
++	EN75_DIAG_REPL_REJ_BASIC,
++	EN75_DIAG_REPL_REJ_ACT,
++	EN75_DIAG_REPL_REJ_ODEV,
++	EN75_DIAG_REPL_REJ_MAC,
++	EN75_DIAG_REPL_REJ_PORTS,
++	EN75_DIAG_COUNT,
++};
++extern u32 en75_diag[EN75_DIAG_COUNT];
++extern u32 en75_diag_crsn[32];
++
+ struct en75_ppe {
+ 	struct device		*dev;
+ 	/* GDM1's netdev: the only egress the FOE can forward to. */
+--- a/econet_qdma.c	2026-07-03 14:38:20.604546633 +0300
++++ b/econet_qdma.c	2026-07-03 14:38:20.624545559 +0300
+@@ -204,6 +204,8 @@
+ 		     PKT_HASH_TYPE_L4);
+ 
+ 
++	en75_diag_crsn[get_erx_crsn(&desc.msg.erx) & 31]++;
++
+ 	switch (get_erx_crsn(&desc.msg.erx)) {
+ 	case 0x0d:	/* UN_HIT: search miss. Under SEARCH_MISS=FORWARD the engine
+ 			 * does not auto-learn, so this is the normal path for a
+--- a/econet_ppe_offload.c	2026-07-03 14:38:20.604546633 +0300
++++ b/econet_ppe_offload.c	2026-07-03 15:09:38.391492001 +0300
+@@ -23,6 +23,7 @@
+  * the rewritten packet to the real egress port instead.
+  */
+ #include <linux/bitfield.h>
++#include <linux/debugfs.h>
+ #include <linux/err.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
+@@ -31,6 +32,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/mutex.h>
+ #include <linux/rhashtable.h>
++#include <linux/seq_file.h>
+ #include <linux/skbuff.h>
+ #include <linux/slab.h>
+ #include <net/flow_offload.h>
+@@ -317,8 +319,10 @@
+ 		return -EEXIST;
+ 
+ 	/* The flowtable always tags the rule with the ingress meta key. */
+-	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META)) {
++		en75_diag[EN75_DIAG_REPL_REJ_BASIC]++;
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
+ 		struct flow_match_control match;
+@@ -327,9 +331,12 @@
+ 		addr_type = match.key->addr_type;
+ 
+ 		if (flow_rule_has_control_flags(match.mask->flags,
+-						f->common.extack))
++						f->common.extack)) {
++			en75_diag[EN75_DIAG_REPL_REJ_BASIC]++;
+ 			return -EOPNOTSUPP;
++		}
+ 	} else {
++		en75_diag[EN75_DIAG_REPL_REJ_BASIC]++;
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+@@ -339,6 +346,7 @@
+ 		flow_rule_match_basic(rule, &match);
+ 		l4proto = match.key->ip_proto;
+ 	} else {
++		en75_diag[EN75_DIAG_REPL_REJ_BASIC]++;
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+@@ -350,6 +358,7 @@
+ 		offload_type = EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T;
+ 		break;
+ 	default:
++		en75_diag[EN75_DIAG_REPL_REJ_BASIC]++;
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+@@ -366,8 +375,10 @@
+ 			break;
+ 		case FLOW_ACTION_VLAN_PUSH:
+ 			if (data.vlan.num + data.pppoe.num == 2 ||
+-			    act->vlan.proto != htons(ETH_P_8021Q))
++			    act->vlan.proto != htons(ETH_P_8021Q)) {
++				en75_diag[EN75_DIAG_REPL_REJ_ACT]++;
+ 				return -EOPNOTSUPP;
++			}
+ 
+ 			data.vlan.vlans[data.vlan.num].id = act->vlan.vid;
+ 			data.vlan.vlans[data.vlan.num].proto = act->vlan.proto;
+@@ -376,13 +387,16 @@
+ 		case FLOW_ACTION_VLAN_POP:
+ 			break;
+ 		case FLOW_ACTION_PPPOE_PUSH:
+-			if (data.pppoe.num == 1 || data.vlan.num == 2)
++			if (data.pppoe.num == 1 || data.vlan.num == 2) {
++				en75_diag[EN75_DIAG_REPL_REJ_ACT]++;
+ 				return -EOPNOTSUPP;
++			}
+ 
+ 			data.pppoe.sid = act->pppoe.sid;
+ 			data.pppoe.num++;
+ 			break;
+ 		default:
++			en75_diag[EN75_DIAG_REPL_REJ_ACT]++;
+ 			return -EOPNOTSUPP;
+ 		}
+ 	}
+@@ -395,12 +409,16 @@
+ 	 * the wired ports and black-hole the flow. This is what broke
+ 	 * Wi-Fi clients' download while wired stayed at line rate.
+ 	 */
+-	if (!odev || odev != ppe->ndev)
++	if (!odev || odev != ppe->ndev) {
++		en75_diag[EN75_DIAG_REPL_REJ_ODEV]++;
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+-	    !is_valid_ether_addr(data.eth.h_dest))
++	    !is_valid_ether_addr(data.eth.h_dest)) {
++		en75_diag[EN75_DIAG_REPL_REJ_MAC]++;
+ 		return -EINVAL;
++	}
+ 
+ 	/* Milestone 2b-3a forces the egress to the CPU: the entry is fully
+ 	 * built (incl. the L2 rewrite from the eth mangle actions) but the
+@@ -425,6 +443,7 @@
+ 		data.src_port = ports.key->src;
+ 		data.dst_port = ports.key->dst;
+ 	} else {
++		en75_diag[EN75_DIAG_REPL_REJ_PORTS]++;
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+@@ -537,6 +556,8 @@
+ 		return err;
+ 	}
+ 
++	en75_diag[keytuple.is_v6 ? EN75_DIAG_REPL_OK6 : EN75_DIAG_REPL_OK4]++;
++
+ 	return 0;
+ }
+ 
+@@ -739,16 +760,26 @@
+ 	if (hw_slot >= EN75_PPE_ENTRIES)
+ 		return;
+ 
++	en75_diag[EN75_DIAG_RXC_CALL]++;
++
+ 	en75_flow_tuple_from_skb(&key, skb);
+-	if (!key.l4proto)
++	if (!key.l4proto) {
++		en75_diag[EN75_DIAG_RXC_NOPARSE]++;
+ 		return;
++	}
+ 
+ 	rcu_read_lock();
+ 	entry = rhashtable_lookup(&ppe->tuple_table, &key,
+ 				  en75_tuple_ht_params);
+-	if (entry && READ_ONCE(entry->state) == EN75_FLOW_PENDING &&
+-	    !time_before(jiffies,
+-			 READ_ONCE(entry->last_scan) + EN75_PPE_SCAN_BACKOFF)) {
++	if (!entry) {
++		en75_diag[key.is_v6 ? EN75_DIAG_RXC_NOLK6 :
++				      EN75_DIAG_RXC_NOLK4]++;
++	} else if (READ_ONCE(entry->state) != EN75_FLOW_PENDING) {
++		en75_diag[EN75_DIAG_RXC_NOTPEND]++;
++	} else if (time_before(jiffies,
++			       READ_ONCE(entry->last_scan) + EN75_PPE_SCAN_BACKOFF)) {
++		en75_diag[EN75_DIAG_RXC_BACKOFF]++;
++	} else {
+ 		int slot;
+ 
+ 		WRITE_ONCE(entry->last_scan, jiffies);
+@@ -758,7 +789,10 @@
+ 		 * re-checks the state under the lock, so a racy read only risks a
+ 		 * retry. */
+ 		slot = en75_ppe_find_engine_slot(ppe, &entry->foe, hw_slot);
+-		if (slot >= 0) {
++		if (slot < 0) {
++			en75_diag[key.is_v6 ? EN75_DIAG_RXC_NOSLOT6 :
++					      EN75_DIAG_RXC_NOSLOT4]++;
++		} else {
+ 			spin_lock_irqsave(&ppe->foe_lock, flags);
+ 			if (entry->state == EN75_FLOW_PENDING) {
+ 				struct en75_foe_entry e = entry->foe;
+@@ -769,6 +803,8 @@
+ 				__en75_ppe_foe_commit(ppe, slot, &e);
+ 				entry->hash = slot;
+ 				entry->state = EN75_FLOW_COMMITTED;
++				en75_diag[key.is_v6 ? EN75_DIAG_RXC_BOUND6 :
++						      EN75_DIAG_RXC_BOUND4]++;
+ 			}
+ 			spin_unlock_irqrestore(&ppe->foe_lock, flags);
+ 		}
+@@ -928,6 +964,43 @@
+ 	}
+ }
+ 
++u32 en75_diag[EN75_DIAG_COUNT];
++u32 en75_diag_crsn[32];
++
++static const char * const en75_diag_names[EN75_DIAG_COUNT] = {
++	[EN75_DIAG_RXC_CALL]	  = "rxc_call",
++	[EN75_DIAG_RXC_NOPARSE]	  = "rxc_noparse",
++	[EN75_DIAG_RXC_NOLK4]	  = "rxc_nolookup_v4",
++	[EN75_DIAG_RXC_NOLK6]	  = "rxc_nolookup_v6",
++	[EN75_DIAG_RXC_NOTPEND]	  = "rxc_notpending",
++	[EN75_DIAG_RXC_BACKOFF]	  = "rxc_backoff",
++	[EN75_DIAG_RXC_NOSLOT4]	  = "rxc_noslot_v4",
++	[EN75_DIAG_RXC_NOSLOT6]	  = "rxc_noslot_v6",
++	[EN75_DIAG_RXC_BOUND4]	  = "rxc_bound_v4",
++	[EN75_DIAG_RXC_BOUND6]	  = "rxc_bound_v6",
++	[EN75_DIAG_REPL_OK4]	  = "repl_ok_v4",
++	[EN75_DIAG_REPL_OK6]	  = "repl_ok_v6",
++	[EN75_DIAG_REPL_REJ_BASIC] = "repl_rej_basic",
++	[EN75_DIAG_REPL_REJ_ACT]  = "repl_rej_action",
++	[EN75_DIAG_REPL_REJ_ODEV] = "repl_rej_odev",
++	[EN75_DIAG_REPL_REJ_MAC]  = "repl_rej_mac",
++	[EN75_DIAG_REPL_REJ_PORTS] = "repl_rej_ports",
++};
++
++static int en75_diag_show(struct seq_file *m, void *v)
++{
++	int i;
++
++	for (i = 0; i < EN75_DIAG_COUNT; i++)
++		seq_printf(m, "%-16s %u\n", en75_diag_names[i], en75_diag[i]);
++	for (i = 0; i < 32; i++)
++		if (en75_diag_crsn[i])
++			seq_printf(m, "crsn_%02x          %u\n", i,
++				   en75_diag_crsn[i]);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(en75_diag);
++
+ int en75_ppe_offload_init(struct en75_ppe *ppe)
+ {
+ 	int err;
+@@ -954,6 +1027,9 @@
+ 	ppe->flow_table_ready = true;
+ 	ppe->tuple_table_ready = true;
+ 
++	debugfs_create_file("diag", 0444, ppe->debugfs, ppe,
++			    &en75_diag_fops);
++
+ 	return 0;
+ }
+ 

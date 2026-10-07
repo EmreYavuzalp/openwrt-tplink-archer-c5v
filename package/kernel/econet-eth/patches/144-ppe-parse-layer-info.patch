@@ -1,0 +1,30 @@
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -62,6 +62,15 @@
+ #define EN75_PPE_IP_PROTO_CHK_IPV4		GENMASK(15, 0)
+ #define EN75_PPE_IP_PROTO_CHK_IPV6		GENMASK(31, 16)
+ 
++/*
++ * Airoha-only "parse layer info" register (no mainline mtk equivalent). The
++ * vendor hw_nat writes it in PpeParseLayerInfo immediately after FLOW_CFG and
++ * it is the only PPE-block core-init register the vendor sets that our driver
++ * otherwise leaves at reset 0. Value taken verbatim from the vendor blob.
++ */
++#define EN75_PPE_PARSE_LAYER_INFO	0x20c
++#define EN75_PPE_PARSE_LAYER_INFO_VAL	0x042a1106
++
+ #define EN75_PPE_TB_CFG			0x21c
+ #define EN75_PPE_TB_CFG_ENTRY_NUM		GENMASK(2, 0)
+ #define EN75_PPE_TB_CFG_ENTRY_80B		BIT(3)
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -409,6 +409,9 @@
+ 	      EN75_PPE_FLOW_CFG_FOE_EBL;
+ 	ppe_w32(ppe, EN75_PPE_FLOW_CFG, val);
+ 
++	/* Airoha vendor sets this alongside FLOW_CFG (PpeParseLayerInfo). */
++	ppe_w32(ppe, EN75_PPE_PARSE_LAYER_INFO, EN75_PPE_PARSE_LAYER_INFO_VAL);
++
+ 	val = FIELD_PREP(EN75_PPE_UNBIND_AGE_MIN_PACKETS, 1000) |
+ 	      FIELD_PREP(EN75_PPE_UNBIND_AGE_DELTA, 3);
+ 	ppe_w32(ppe, EN75_PPE_UNBIND_AGE, val);

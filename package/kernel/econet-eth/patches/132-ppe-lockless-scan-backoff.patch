@@ -1,0 +1,107 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: lockless engine-slot scan + per-flow backoff
+
+Restricting the bind to crsn 0x0f alone (prev patch) missed the bind window
+for many flows (the engine signals 0x0f early, before the flowtable has staged
+the flow), so few flows bound and most traffic stayed on the slow path.
+
+Reinstate binding on HIT_UNBIND (0x0e) as well as RATE_REACHED (0x0f), but make
+the engine-slot scan affordable:
+ - run the 16384-entry scan WITHOUT holding foe_lock. Holding it (IRQ-off)
+   across thousands of uncached reads blocked NAPI long enough to drop packets
+   and collapse TCP to a few Mbit. The scan is read-only; the commit re-checks
+   the flow state under the lock, so a racy read only risks a harmless retry.
+ - rate-limit the scan per flow (EN75_PPE_SCAN_BACKOFF), so a flow that cannot
+   yet be bound is retried at most ~10x/s instead of on every packet.
+
+A flow normally binds on its first scan once the engine has learned its UNBIND
+entry, then stays COMMITTED and is forwarded entirely in hardware.
+
+diff -ruN b131/econet_ppe_offload.c b132/econet_ppe_offload.c
+--- a/econet_ppe_offload.c	2026-06-29 22:49:01.701474212 +0300
++++ b/econet_ppe_offload.c	2026-06-29 22:50:02.366202815 +0300
+@@ -99,6 +99,7 @@
+ 	struct en75_foe_entry foe;	/* prebuilt; committed lazily by RX */
+ 	u32 hash;			/* slot, valid once COMMITTED */
+ 	int state;
++	unsigned long last_scan;	/* jiffies of last engine-slot scan */
+ };
+ 
+ static const struct rhashtable_params en75_flow_ht_params = {
+@@ -525,6 +526,9 @@
+ 	return 0;
+ }
+ 
++/* Min jiffies between engine-slot scans for one still-unbound flow. */
++#define EN75_PPE_SCAN_BACKOFF (HZ / 10)
++
+ /*
+  * Find the slot where the engine auto-learned (FORWARD_BUILD) an UNBIND entry
+  * for this flow. The descriptor-reported hash is not the engine's real search
+@@ -597,15 +601,21 @@
+ 	rcu_read_lock();
+ 	entry = rhashtable_lookup(&ppe->tuple_table, &key,
+ 				  en75_tuple_ht_params);
+-	if (entry) {
+-		spin_lock_irqsave(&ppe->foe_lock, flags);
+-		if (entry->state == EN75_FLOW_PENDING) {
+-			int slot = en75_ppe_find_engine_slot(ppe, &entry->foe);
+-
+-			/* Stay PENDING until the engine has auto-learned this
+-			 * flow's UNBIND entry; then bind our prebuilt entry at
+-			 * that exact slot - the one the engine actually searches. */
+-			if (slot >= 0) {
++	if (entry && READ_ONCE(entry->state) == EN75_FLOW_PENDING &&
++	    !time_before(jiffies, READ_ONCE(entry->last_scan) + EN75_PPE_SCAN_BACKOFF)) {
++		int slot;
++
++		WRITE_ONCE(entry->last_scan, jiffies);
++
++		/* Find the slot where the engine auto-learned this flow's UNBIND
++		 * entry. Scan lockless: it is 16384 uncached reads, and holding
++		 * foe_lock (IRQ-off) across it blocked NAPI long enough to drop
++		 * packets and collapse TCP. The commit below re-checks the state
++		 * under the lock, so a racy read here only risks a retry. */
++		slot = en75_ppe_find_engine_slot(ppe, &entry->foe);
++		if (slot >= 0) {
++			spin_lock_irqsave(&ppe->foe_lock, flags);
++			if (entry->state == EN75_FLOW_PENDING) {
+ 				struct en75_foe_entry e = entry->foe;
+ 
+ 				e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
+@@ -617,11 +627,8 @@
+ 				pr_info_ratelimited("econet-eth: PPE bound flow at engine slot %u (hw_slot was %u)\n",
+ 						    slot, hw_slot);
+ 			}
++			spin_unlock_irqrestore(&ppe->foe_lock, flags);
+ 		}
+-		/* COMMITTED flows that still miss are handled silently: once a
+-		 * flow is bound at the engine's slot it is forwarded in hardware
+-		 * and no longer reaches the CPU, so no action is needed here. */
+-		spin_unlock_irqrestore(&ppe->foe_lock, flags);
+ 	}
+ 	rcu_read_unlock();
+ }
+diff -ruN b131/econet_qdma.c b132/econet_qdma.c
+--- a/econet_qdma.c	2026-06-29 22:49:01.705473996 +0300
++++ b/econet_qdma.c	2026-06-29 22:50:02.366202815 +0300
+@@ -224,13 +224,12 @@
+ 	}
+ 
+ 	switch (get_erx_crsn(&desc.msg.erx)) {
+-	case 0x0f:	/* HIT_UNBIND_RATE_REACHED: the engine just hit an UNBIND
+-			 * entry often enough to ask us to bind it. Only act here:
+-			 * the UNBIND entry is guaranteed present (it was just hit)
+-			 * so the table scan finds it first try, and this fires
+-			 * roughly once per hot flow instead of on every miss -
+-			 * the per-packet scan was saturating the CPU. Plain
+-			 * UN_HIT/HIT_UNBIND (0x0d/0x0e) are left on the slow path. */
++	case 0x0e:	/* HIT_UNBIND: an UNBIND entry exists for this flow. */
++	case 0x0f:	/* HIT_UNBIND_RATE_REACHED: the engine wants this flow bound.
++			 * Try to bind on both: the offload code scans for the
++			 * engine's learned slot, but rate-limits the (expensive)
++			 * scan per flow so the CPU is not saturated. 0x0d (UN_HIT,
++			 * before the engine has learned) stays on the slow path. */
+ 		en75_ppe_offload_rx_commit(en75_eth_ppe(q->qdma->eth), skb, hash);
+ 		break;
+ 	case 0x16: {	/* HIT_BIND_FORCE_CPU: a bound entry was hit. Log once

@@ -1,0 +1,50 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: back off the NAPI poll timers under load
+
+The TX-done poll hrtimer (150 us) and the RX watchdog hrtimer (1 ms,
+which fired napi_schedule unconditionally every tick) were needed to
+work around the unreliable QDMA done-queue / RX-DONE interrupts for low
+traffic. Under sustained real traffic, however, the hardware interrupts
+do fire (econet IRQ advances ~58k over a download), so these timers
+become redundant overhead: on an Archer C5v running PPPoE they produced
+~350k timer interrupts during a single speed test, ~71% softirq with
+27% CPU still idle (throughput latency-bound, not CPU-bound), an
+"hrtimer: interrupt took 22470 ns" warning and an eventual
+"sched: RT throttling activated" with a momentary ethernet/Wi-Fi stall.
+
+Two conservative changes:
+  - Stretch the TX-done poll from 150 us to 500 us. The 128-entry TX
+    ring still cannot fill within that window even at the driver's peak
+    (~21 kpps -> ~6 ms to fill), so throughput is unaffected while the
+    timer-interrupt rate drops ~3x.
+  - Only napi_schedule from the RX watchdog when the ring actually has
+    unprocessed descriptors. Under load the real RX-DONE IRQ already
+    drained it, so the unconditional wake just burned a softirq per
+    tick; the poll is still there for packets the edge-only IRQ missed.
+
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -444,7 +444,7 @@
+  * Instead of relying on the hardware, poll for completions shortly
+  * after every submission and keep polling while anything is in
+  * flight. */
+-#define EN75_TX_DONE_KICK_NS	150000
++#define EN75_TX_DONE_KICK_NS	500000
+ 
+ static enum hrtimer_restart en75_tx_done_kick(struct hrtimer *t)
+ {
+@@ -479,7 +479,13 @@
+ 	if (!READ_ONCE(qdma->users) || READ_ONCE(qdma->destroying))
+ 		return HRTIMER_NORESTART;
+ 
+-	napi_schedule(&q->napi);
++	/* Only wake NAPI if the ring actually has unprocessed descriptors.
++	 * Under load the real RX-DONE IRQ already drains the ring, so an
++	 * unconditional napi_schedule here just burns a softirq every tick
++	 * and adds scheduler/timer pressure; the poll is only needed for the
++	 * occasional packet the (edge-only) RX-DONE IRQ failed to signal. */
++	if (en75_rreg(&q->qchain_regs->rx_hwi) != (q->cpu_i + 1) % q->ndesc)
++		napi_schedule(&q->napi);
+ 	hrtimer_forward_now(t, ns_to_ktime(EN75_RX_KICK_NS));
+ 
+ 	return HRTIMER_RESTART;

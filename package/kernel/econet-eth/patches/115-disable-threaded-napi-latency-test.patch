@@ -1,0 +1,30 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: keep QDMA NAPI in softirq context
+
+The EN751221 QDMA driver currently enables threaded NAPI on the dummy
+NAPI netdev. On TP-Link Archer C5v this shows up as a very regular
+latency sawtooth when pinging the router over wired LAN: replies drift
+from about 10-11 ms down to 1-2 ms and then jump back up again. With
+larger ICMP packets the same pattern can also produce loss.
+
+This pattern is not random link noise; it is consistent with scheduler
+or jiffy-aligned NAPI wakeup latency. Keep RX and TX-completion NAPI in
+the normal softirq context so packets are processed directly from the
+networking poll path instead of waiting for a NAPI kthread to be
+scheduled.
+
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -1235,7 +1235,11 @@ struct en75_qdma *en75_qdma_init(struct en75_eth *eth, int id,
+ 	if (!qdma->napi_dev)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	qdma->napi_dev->threaded = true;
++	/* Threaded NAPI adds scheduler latency on this target; keep the
++	 * latency-sensitive QDMA RX/TX-completion path in softirq context.
++	 */
++	qdma->napi_dev->threaded = false;
++
+ 	snprintf(qdma->napi_dev->name, sizeof qdma->napi_dev->name, "qdma%d_eth", id);
+ 
+ 	err = en75_init(eth->dev, qdma, irqs, num_irqs);

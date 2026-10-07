@@ -1,0 +1,69 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: log hw_slot vs committed slot on PPE re-miss
+
+Bind count rises during speed tests but crsn 0x16 never appears. Extend RX
+commit diagnostics: log ingress tuple and FOE orig on the first commits,
+and on re-miss print both the committed slot and the hardware-reported
+hw_slot plus skb/FOE tuple words to tell hash-slot drift from tuple skew.
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -543,6 +543,7 @@
+ 	if (entry) {
+ 		spin_lock_irqsave(&ppe->foe_lock, flags);
+ 		if (entry->state == EN75_FLOW_PENDING) {
++			static atomic_t cdbg = ATOMIC_INIT(8);
+ 			struct en75_foe_entry e = entry->foe;
+ 
+ 			e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
+@@ -551,16 +552,43 @@
+ 			__en75_ppe_foe_commit(ppe, hw_slot, &e);
+ 			entry->hash = hw_slot;
+ 			entry->state = EN75_FLOW_COMMITTED;
+-			pr_info_once("econet-eth: PPE flow committed at slot %u (FORWARD miss)\n",
+-				     hw_slot);
++			if (atomic_dec_if_positive(&cdbg) >= 0) {
++				struct en75_ipv4_tuple *o = &e.ipv4.orig;
++
++				pr_info("econet-eth: PPE commit hw_slot=%u skb %pI4:%u->%pI4:%u "
++					"foe-orig %08x/%08x/%08x\n",
++					hw_slot,
++					&key.src[0], ntohs(key.sport),
++					&key.dst[0], ntohs(key.dport),
++					o->src_ip, o->dest_ip, o->ports);
++			}
+ 		} else if (entry->state == EN75_FLOW_COMMITTED) {
+-			static atomic_t dbg = ATOMIC_INIT(16);
++			static atomic_t dbg = ATOMIC_INIT(32);
++			struct en75_ipv4_tuple *o;
+ 
+-			if (atomic_dec_if_positive(&dbg) >= 0)
+-				pr_info("econet-eth: re-miss slot=%u state=%u ib1=%08x\n",
+-					entry->hash,
++			if (atomic_dec_if_positive(&dbg) >= 0) {
++				o = &ppe->foe[entry->hash].ipv4.orig;
++				pr_info("econet-eth: re-miss committed=%u hw_slot=%u "
++					"state=%u ib1@%u=%08x skb %pI4:%u->%pI4:%u "
++					"foe-orig %08x/%08x/%08x%s\n",
++					entry->hash, hw_slot,
+ 					(u32)FIELD_GET(EN75_FOE_IB1_STATE, ppe->foe[entry->hash].ib1),
+-					ppe->foe[entry->hash].ib1);
++					entry->hash,
++					ppe->foe[entry->hash].ib1,
++					&key.src[0], ntohs(key.sport),
++					&key.dst[0], ntohs(key.dport),
++					o->src_ip, o->dest_ip, o->ports,
++					hw_slot != entry->hash ?
++					" SLOT-MISMATCH" : "");
++			}
++			if (atomic_read(&dbg) >= 0 && hw_slot != entry->hash &&
++			    hw_slot < EN75_PPE_ENTRIES) {
++				o = &ppe->foe[hw_slot].ipv4.orig;
++				pr_info("econet-eth: re-miss hw_slot=%u ib1=%08x "
++					"foe-orig %08x/%08x/%08x\n",
++					hw_slot, ppe->foe[hw_slot].ib1,
++					o->src_ip, o->dest_ip, o->ports);
++			}
+ 		}
+ 		spin_unlock_irqrestore(&ppe->foe_lock, flags);
+ 	}

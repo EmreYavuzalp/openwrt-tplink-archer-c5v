@@ -1,0 +1,50 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: diagnose find_engine_slot failures (noslot)
+
+After the PPPoE and backoff fixes, binds start but stay few while a "noslot"
+counter climbs: find_engine_slot returns -1 for most flows. Log, rate-limited,
+the computed candidate slot, its live STATE/type, and the wanted tuple when
+both the O(1) candidate and the full scan miss, so we can distinguish a wrong
+slot (formula) from the engine having already auto-bound the slot to garbage
+(FORWARD_BUILD) or never leaving an UNBIND for us at all.
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -628,16 +628,33 @@
+ 				     const struct en75_foe_entry *want,
+ 				     u32 hw_slot)
+ {
+-	u32 i;
++	u32 i, cand;
+ 
+-	i = (hw_slot + (hw_slot % 5) * EN75_PPE_ENTRIES) * 2 / 5;
+-	if (en75_ppe_slot_matches(ppe, i, want))
+-		return i;
++	cand = (hw_slot + (hw_slot % 5) * EN75_PPE_ENTRIES) * 2 / 5;
++	if (en75_ppe_slot_matches(ppe, cand, want))
++		return cand;
+ 
+ 	for (i = 0; i < EN75_PPE_ENTRIES; i++)
+ 		if (en75_ppe_slot_matches(ppe, i, want))
+ 			return i;
+ 
++	/* DIAGNOSTIC: neither the computed candidate nor a full scan found an
++	 * UNBIND entry matching this flow. Dump the candidate's actual contents
++	 * and the wanted tuple so we can tell a wrong-slot (formula) miss from
++	 * the engine having already auto-bound the slot (FORWARD_BUILD garbage)
++	 * or never having learned an UNBIND at all. */
++	{
++		u32 ib1 = (cand < EN75_PPE_ENTRIES) ?
++			  le32_to_cpu(READ_ONCE(ppe->foe[cand].ib1)) : 0;
++
++		pr_info_ratelimited("econet-eth: noslot hw=%u cand=%u state@cand=%lu type@cand=%lu | want type=%lu sip=%08x dip=%08x ports=%08x\n",
++				    hw_slot, cand,
++				    FIELD_GET(EN75_FOE_IB1_STATE, ib1),
++				    FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1),
++				    FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, want->ib1),
++				    want->ipv4.orig.src_ip, want->ipv4.orig.dest_ip,
++				    want->ipv4.orig.ports);
++	}
+ 	return -1;
+ }
+ 

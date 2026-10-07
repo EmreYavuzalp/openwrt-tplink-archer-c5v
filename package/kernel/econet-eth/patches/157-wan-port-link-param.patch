@@ -1,0 +1,79 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: [PATCH] econet-eth: expose external MT7530 WAN port link status
+
+The external MT7530 per-port PHY link is not exposed to userspace on this
+platform: there is no DSA (so no per-port netdev carrier), no swconfig, and
+no mdio bus registered. A WAN VLAN interface (e.g. eth0.35) always reports
+carrier up because it reflects the internal CPU<->switch link, not the
+physical WAN port, so it cannot drive a "cable in WAN port" LED.
+
+Expose the WAN port's link status read-only at
+/sys/module/econet_eth/parameters/wan_link (0/1), read from the external
+MT7530 PMSR (PMCR + 8) bit 0 using the existing register accessor. A
+userspace helper can poll it to drive the front-panel WAN LED. The WAN port
+number is taken from the econet,mt7530-wan-port device-tree property.
+
+Signed-off-by: Emre Yavuzalp <emreyavuzalp@gmail.com>
+---
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -40,6 +40,7 @@
+ #include <linux/of_net.h>
+ #include <linux/iopoll.h>
+ #include <linux/workqueue.h>
++#include <linux/moduleparam.h>
+ 
+ #include "gdm_regs.h"
+ #include "econet_ppe.h"
+@@ -335,6 +336,32 @@
+ 	return val;
+ }
+ 
++/*
++ * WAN port PHY link status, for driving a WAN LED from userspace. The external
++ * MT7530 per-port link is not otherwise exposed on this platform (no DSA, no
++ * swconfig, no mdio bus). Read the WAN port's PMSR (PMCR + 8) bit 0.
++ * Exposed read-only at /sys/module/econet_eth/parameters/wan_link.
++ */
++static struct en75_eth_pvt *en75_wan_eth;
++static u32 en75_wan_port = 4;
++
++static int en75_wan_link_get(char *buffer, const struct kernel_param *kp)
++{
++	u32 link = 0;
++
++	if (en75_wan_eth)
++		link = en75_ext_switch_read_poll(en75_wan_eth,
++				MT753X_PMCR_P(en75_wan_port) + 8) & 1;
++
++	return sprintf(buffer, "%u\n", link);
++}
++
++static const struct kernel_param_ops en75_wan_link_ops = {
++	.get = en75_wan_link_get,
++};
++module_param_cb(wan_link, &en75_wan_link_ops, NULL, 0444);
++MODULE_PARM_DESC(wan_link, "External MT7530 WAN port PHY link status (0/1)");
++
+ static int en75_ext_switch_rmw(struct en75_eth_pvt *eth, u32 reg, u32 mask,
+ 				       u32 val)
+ {
+@@ -728,6 +755,9 @@
+ 		return dev_err_probe(eth->pub.dev, -EINVAL,
+ 				     "invalid external MT7530 VLAN split config\n");
+ 
++	en75_wan_eth = eth;
++	en75_wan_port = wan_port;
++
+ 	cpu_mask = BIT(cpu_port);
+ 	wan_mask = BIT(wan_port);
+ 	if (iptv) {
+@@ -1060,6 +1090,8 @@
+ 	if (!eth)
+ 		return;
+ 
++	en75_wan_eth = NULL;
++
+ 	cancel_delayed_work_sync(&eth->mt7530_reapply_work);
+ 
+ 	en75_ppe_stop(eth->ppe);

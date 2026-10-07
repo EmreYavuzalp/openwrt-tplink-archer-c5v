@@ -1,0 +1,77 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: forward bound flows in hardware (egress GDM1), drop debug spam
+
+crsn 0x16 (HIT_BIND_FORCE_CPU) now fires: flows bind and the engine hits them,
+but every bound packet was still punted to the CPU because the FOE entry's
+egress was forced to EN75_PPE_PSE_CPU_PORT (safe staging). Switch the egress to
+EN75_PPE_PSE_GDM1_PORT - the single GDM that feeds the external MT7530 over
+TRGMII. The L2 rewrite already carries the VLAN push from the flow actions, so
+the switch sends the frame out the right physical port; LAN and WAN share the
+one GDM. Bound flows are now forwarded entirely in hardware and never reach the
+CPU, which both delivers the throughput and stops the per-flow RX scan.
+
+Also remove the per-packet COMMITTED "re-miss" debug logging: its second branch
+was gated by atomic_read(&dbg) >= 0, which stays true once the counter hits 0,
+so it printk'd on every packet and throttled throughput on the serial console.
+
+diff -ruN b129/econet_ppe_offload.c b130/econet_ppe_offload.c
+--- a/econet_ppe_offload.c	2026-06-29 22:05:12.467132917 +0300
++++ b/econet_ppe_offload.c	2026-06-29 22:08:38.507951115 +0300
+@@ -351,8 +351,12 @@
+ 	 * HIT_BIND_FORCE_CPU) with no forwarding risk. 3b resolves the
+ 	 * REDIRECT odev to a GDM port and uses it here instead.
+ 	 */
++	/* Egress to the GDM port that feeds the external MT7530 over TRGMII.
++	 * The L2 rewrite (incl. the VLAN push from the flow actions) tells the
++	 * switch which physical port to use, so a single GDM serves LAN+WAN.
++	 * The bound flow is now forwarded entirely in hardware (no CPU). */
+ 	err = en75_foe_entry_prepare(&foe, offload_type, l4proto,
+-				     EN75_PPE_PSE_CPU_PORT,
++				     EN75_PPE_PSE_GDM1_PORT,
+ 				     data.eth.h_source, data.eth.h_dest);
+ 	if (err)
+ 		return err;
+@@ -613,40 +617,10 @@
+ 				pr_info_ratelimited("econet-eth: PPE bound flow at engine slot %u (hw_slot was %u)\n",
+ 						    slot, hw_slot);
+ 			}
+-		} else if (entry->state == EN75_FLOW_COMMITTED) {
+-			static atomic_t dbg = ATOMIC_INIT(32);
+-			struct en75_ipv4_tuple *o;
+-
+-			if (atomic_dec_if_positive(&dbg) >= 0) {
+-				struct en75_foe_ipv4 *v4 = &ppe->foe[entry->hash].ipv4;
+-				struct en75_ipv4_tuple *n = &v4->new;
+-
+-				o = &v4->orig;
+-				pr_info("econet-eth: re-miss committed=%u hw_slot=%u "
+-					"state=%u ib1@%u=%08x skb %pI4:%u->%pI4:%u "
+-					"orig %08x/%08x/%08x new %08x/%08x/%08x ib2=%08x%s\n",
+-					entry->hash, hw_slot,
+-					(u32)FIELD_GET(EN75_FOE_IB1_STATE, le32_to_cpu(ppe->foe[entry->hash].ib1)),
+-					entry->hash,
+-					le32_to_cpu(ppe->foe[entry->hash].ib1),
+-					&key.src[0], ntohs(key.sport),
+-					&key.dst[0], ntohs(key.dport),
+-					le32_to_cpu(o->src_ip), le32_to_cpu(o->dest_ip), le32_to_cpu(o->ports),
+-					le32_to_cpu(n->src_ip), le32_to_cpu(n->dest_ip), le32_to_cpu(n->ports),
+-					le32_to_cpu(v4->ib2),
+-					hw_slot != entry->hash ?
+-					" SLOT-MISMATCH" : "");
+-			}
+-			if (atomic_read(&dbg) >= 0 && hw_slot != entry->hash &&
+-			    hw_slot < EN75_PPE_ENTRIES) {
+-				o = &ppe->foe[hw_slot].ipv4.orig;
+-				pr_info("econet-eth: re-miss hw_slot=%u ib1=%08x "
+-					"foe-orig %08x/%08x/%08x\n",
+-					hw_slot, le32_to_cpu(ppe->foe[hw_slot].ib1),
+-					le32_to_cpu(o->src_ip), le32_to_cpu(o->dest_ip),
+-					le32_to_cpu(o->ports));
+-			}
+ 		}
++		/* COMMITTED flows that still miss are handled silently: once a
++		 * flow is bound at the engine's slot it is forwarded in hardware
++		 * and no longer reaches the CPU, so no action is needed here. */
+ 		spin_unlock_irqrestore(&ppe->foe_lock, flags);
+ 	}
+ 	rcu_read_unlock();

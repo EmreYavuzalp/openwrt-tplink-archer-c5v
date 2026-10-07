@@ -1,0 +1,73 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: dump live and built FOE words around RX bind commit
+
+The current failure mode is no longer "cannot find a slot": FORWARD_BUILD
+learns UNBIND entries, the driver resolves a slot, and BIND commits are logged.
+Yet the engine keeps reporting 0x0f and never reports a bound hit. Capture the
+exact live table words before and after the commit, plus the host-order entry
+being written, for the first few commits.
+
+This distinguishes three remaining cases in one boot:
+  - the live entry never changes to BIND,
+  - the entry is published with the wrong IB1/state/type bits,
+  - the entry is BIND but the tuple/L2/trailer words differ from what the
+    engine learned and searches.
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -578,6 +578,45 @@ en75_ppe_offload_stats(struct en75_ppe *ppe, struct flow_cls_offload *f)
+ /* Min jiffies between engine-slot scans for one still-unbound flow. */
+ #define EN75_PPE_SCAN_BACKOFF (HZ / 10)
+ 
++static void en75_ppe_dump_bind_words(struct en75_ppe *ppe, u32 slot,
++				     const struct en75_foe_entry *built,
++				     const char *tag)
++{
++	static u32 dumps;
++	const u32 *live = (const u32 *)&ppe->foe[slot];
++	const u32 *b = (const u32 *)built;
++	u32 l0, l1, l2, l3, l4, l5, l11, l12, l13, l14, l15, l16, l17, l18, l19;
++	u32 bi0, bi1, bi2, bi3, bi4, bi5, bi11, bi12, bi13, bi14, bi15, bi16, bi17, bi18, bi19;
++
++	if (dumps++ >= 16)
++		return;
++
++	l0 = le32_to_cpu(READ_ONCE(live[0]));
++	l1 = le32_to_cpu(READ_ONCE(live[1]));
++	l2 = le32_to_cpu(READ_ONCE(live[2]));
++	l3 = le32_to_cpu(READ_ONCE(live[3]));
++	l4 = le32_to_cpu(READ_ONCE(live[4]));
++	l5 = le32_to_cpu(READ_ONCE(live[5]));
++	l11 = le32_to_cpu(READ_ONCE(live[11]));
++	l12 = le32_to_cpu(READ_ONCE(live[12]));
++	l13 = le32_to_cpu(READ_ONCE(live[13]));
++	l14 = le32_to_cpu(READ_ONCE(live[14]));
++	l15 = le32_to_cpu(READ_ONCE(live[15]));
++	l16 = le32_to_cpu(READ_ONCE(live[16]));
++	l17 = le32_to_cpu(READ_ONCE(live[17]));
++	l18 = le32_to_cpu(READ_ONCE(live[18]));
++	l19 = le32_to_cpu(READ_ONCE(live[19]));
++
++	bi0 = b[0]; bi1 = b[1]; bi2 = b[2]; bi3 = b[3]; bi4 = b[4]; bi5 = b[5];
++	bi11 = b[11]; bi12 = b[12]; bi13 = b[13]; bi14 = b[14]; bi15 = b[15];
++	bi16 = b[16]; bi17 = b[17]; bi18 = b[18]; bi19 = b[19];
++
++	pr_info("econet-eth: BINDDBG %s slot=%u live0-5=%08x %08x %08x %08x %08x %08x live11-19=%08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		tag, slot, l0, l1, l2, l3, l4, l5, l11, l12, l13, l14, l15, l16, l17, l18, l19);
++	pr_info("econet-eth: BINDDBG %s slot=%u built0-5=%08x %08x %08x %08x %08x %08x built11-19=%08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		tag, slot, bi0, bi1, bi2, bi3, bi4, bi5, bi11, bi12, bi13, bi14, bi15, bi16, bi17, bi18, bi19);
++}
++
+ /*
+  * Find the slot where the engine auto-learned (FORWARD_BUILD) an UNBIND entry
+  * for this flow. The descriptor-reported hash is not the engine's real search
+@@ -772,7 +811,9 @@ void en75_ppe_offload_rx_commit(struct en75_ppe *ppe, struct sk_buff *skb,
+ 				e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
+ 				e.ib1 |= FIELD_PREP(EN75_FOE_IB1_STATE, EN75_FOE_STATE_BIND);
+ 				e.ib1 |= en75_ppe_timestamp(ppe);
++				en75_ppe_dump_bind_words(ppe, slot, &e, "pre");
+ 				__en75_ppe_foe_commit(ppe, slot, &e);
++				en75_ppe_dump_bind_words(ppe, slot, &e, "post");
+ 				entry->hash = slot;
+ 				entry->state = EN75_FLOW_COMMITTED;
+ 				d_bound++;

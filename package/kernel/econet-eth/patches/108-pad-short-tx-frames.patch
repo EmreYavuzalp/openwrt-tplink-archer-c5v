@@ -1,0 +1,35 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: pad short TX frames before handing them to QDMA
+
+The hardware does not reliably transmit short frames as valid Ethernet
+frames. On TP-Link Archer C5v this was visible with PPPoE discovery:
+the default PADI is only 36 bytes on eth0 after the 802.1Q header is
+added, tcpdump sees it locally, but the peer never sees it on the wire.
+Forcing a long PPPoE Service-Name makes the PADI large enough and the
+full PADI/PADO/PADR/PADS exchange succeeds, which isolates the failure
+to short-frame TX padding rather than VLAN35 or PPPoE parsing.
+
+Pad every short TX skb to ETH_ZLEN before BQL accounting and before the
+QDMA descriptor length is taken from skb_headlen(). This is the normal
+netdev behaviour for hardware that does not pad runt frames itself.
+
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -219,6 +219,17 @@ static netdev_tx_t en75_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	if (skb_linearize(skb))
+ 		goto error;
+ 
++	/* QDMA/GDM does not reliably pad runt frames. A default PPPoE PADI
++	 * over VLAN35 is shorter than ETH_ZLEN and is visible on the local
++	 * netdev but not on the wire unless it is padded here. eth_skb_pad()
++	 * frees the skb on error, so do not fall through to the common error
++	 * path in that case. */
++	if (eth_skb_pad(skb)) {
++		dev->stats.tx_dropped++;
++		return NETDEV_TX_OK;
++	}
++	len = skb->len;
++
+ 	netdev_tx_sent_queue(txq, len);
+ 
+ 	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0);

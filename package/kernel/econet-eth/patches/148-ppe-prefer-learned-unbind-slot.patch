@@ -1,0 +1,58 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: prefer the engine-learned UNBIND slot before IPv4 hash
+
+After retesting SEARCH_MISS=FORWARD_BUILD, the engine again reports 0x0e/0x0f,
+so the lookup/learn path is alive only in FORWARD_BUILD mode on this PPE. But
+the driver still binds IPv4 flows at the software FoeHashFun slot directly.
+That ignores the actual entry the engine just learned and reported through the
+RX descriptor, so any collision/way choice or descriptor-scale detail leaves
+the BIND in a slot the engine is not currently using.
+
+For FORWARD_BUILD, use the learned UNBIND entry as the source of truth: first
+try the descriptor-derived candidate and then scan for a matching UNBIND. Only
+fall back to the software hash if no learned entry is present. This preserves
+the recovered hash as a safety net, but lets the normal bind path replace the
+engine's own learned entry in place.
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -660,15 +660,27 @@ static int en75_ppe_find_engine_slot(struct en75_ppe *ppe,
+ 				     const struct en75_foe_entry *want,
+ 				     u32 hw_slot)
+ {
+ 	u32 type = FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, want->ib1);
+ 	u32 i, cand;
+ 
+-	/* IPv4: compute the engine's search slot straight from the tuple. */
++	cand = (hw_slot + (hw_slot % 5) * EN75_PPE_ENTRIES) * 2 / 5;
++	if (en75_ppe_slot_matches(ppe, cand, want))
++		return cand;
++
++	for (i = 0; i < EN75_PPE_ENTRIES; i++)
++		if (en75_ppe_slot_matches(ppe, i, want))
++			return i;
++
++	/* If FORWARD_BUILD has not learned this flow yet, IPv4 can still use
++	 * the recovered vendor hash as a fallback. In the common 0x0e/0x0f
++	 * path above, however, the learned entry wins so collisions/way choice
++	 * stay exactly as the engine selected them.
++	 */
+ 	if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT ||
+ 	    type == EN75_PPE_PKT_TYPE_IPV4_ROUTE) {
+ 		i = en75_ppe_ipv4_hash_slot(want);
+ 		return (i < EN75_PPE_ENTRIES) ? (int)i : -1;
+ 	}
+ 
+ 	/* IPv6 uses a different hash; fall back to the descriptor-scaled
+ 	 * candidate plus a scan for the engine's learned UNBIND. */
+-	cand = (hw_slot + (hw_slot % 5) * EN75_PPE_ENTRIES) * 2 / 5;
+-	if (en75_ppe_slot_matches(ppe, cand, want))
+-		return cand;
+-
+-	for (i = 0; i < EN75_PPE_ENTRIES; i++)
+-		if (en75_ppe_slot_matches(ppe, i, want))
+-			return i;
+-
+ 	return -1;
+ }
+ 

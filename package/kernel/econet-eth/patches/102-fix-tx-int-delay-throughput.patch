@@ -1,0 +1,21 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: clear tx_int_delay so TX completions are not throttled
+
+en75_init_final() clears rx_int_delay but never touches tx_int_delay, so
+the TX interrupt-delay timer keeps whatever value the boot ROM left in it.
+On boards where that value is large (e.g. TP-Link Archer C5v) the TX-done
+interrupt is held off for milliseconds, the TX ring drains at only a few
+hundred packets/s, the netdev queue stays stopped and the qdisc silently
+drops the overflow. RX is unaffected because rx_int_delay is zeroed.
+
+The result is wildly asymmetric throughput: ~130 Mbit/s RX but only
+~9 Mbit/s TX (with matching ~45% UDP loss and TCP collapse in both
+directions, since ACKs also traverse the TX path). Clearing tx_int_delay
+to 0, exactly like rx_int_delay, makes TX completions interrupt-driven
+per packet again and restores line-rate TX.
+
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -926,1 +926,2 @@ static int en75_init_final(struct en75_qdma *qdma)
++	en75_wreg(0U, &qdma->regs->tx_int_delay);
+ 	en75_wreg(0U, &qdma->regs->rx_int_delay);

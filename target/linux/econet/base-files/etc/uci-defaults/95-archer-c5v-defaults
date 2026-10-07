@@ -1,0 +1,109 @@
+#!/bin/sh
+# TP-Link Archer C5v customer image defaults: timezone + hostname + Wi-Fi.
+#
+# Wi-Fi (both bands enabled on first boot):
+#   2.4 GHz SSID : ArcherC5v-<serial last4>_OpenWrt_2.4GHz
+#   5   GHz SSID : ArcherC5v-<serial last4>_OpenWrt_5GHz  (channel 40)
+#   key          : the unit's own stock PreSharedKey, read from the config MTD
+#                  partition; a random per-unit key if none can be read
+#   country      : TR
+# The serial's last 4 characters equal the last two octets of the label MAC
+# (which the driver programs onto eth0) -- verified on the SurNet units. So the
+# suffix is read from eth0's MAC rather than parsing the config partition.
+#
+# Timezone: UTC+3, Europe/Istanbul.  Hostname: Archer-C5v.
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "tplink,archer-c5v" ] || exit 0
+
+# Apply factory defaults only once. The marker lives in /etc/config/system,
+# which sysupgrade preserves, so a config-keeping firmware update does NOT
+# re-run this script and does NOT clobber a customer's changed SSID / password /
+# timezone. A factory reset wipes the config (and the marker), so the defaults
+# come back. (uci-defaults otherwise re-run after every sysupgrade.)
+[ "$(uci -q get system.@system[0].c5v_provisioned)" = "1" ] && exit 0
+
+# --- timezone + hostname (always applies; committed before the Wi-Fi retry) ---
+uci -q batch <<-EOF
+	set system.@system[0].timezone='<+03>-3'
+	set system.@system[0].zonename='Europe/Istanbul'
+	set system.@system[0].hostname='Archer-C5v'
+	commit system
+EOF
+# apply the new hostname immediately (also picked up on next boot from config)
+echo 'Archer-C5v' > /proc/sys/kernel/hostname 2>/dev/null
+
+# --- flow offloading ON by default (software + hardware PPE) ---
+# The econet-eth PPE binds the nftables flowtable, so flow_offloading_hw=1
+# activates the hardware NAT fast-path (gigabit wired). Set both.
+uci -q batch <<-EOF
+	set firewall.@defaults[0].flow_offloading='1'
+	set firewall.@defaults[0].flow_offloading_hw='1'
+	commit firewall
+EOF
+
+# --- Wi-Fi ---
+# First boot may run radio detection after us; make sure a config exists.
+[ -f /etc/config/wireless ] || /sbin/wifi config 2>/dev/null
+# No radios detected yet -> return non-zero so this uci-default re-runs on the
+# next boot (it is only removed once it exits 0).
+[ -n "$(uci -q show wireless | grep '=wifi-iface')" ] || exit 1
+
+# --- Wi-Fi key: this unit's own stock PreSharedKey, from the config partition ---
+wifi_key_from_config() {
+	local n f
+	n="$(sed -n 's/^mtd\([0-9]*\):.*"config"$/\1/p' /proc/mtd 2>/dev/null)"
+	[ -n "$n" ] || return 1
+	f="$(dd if=/dev/mtd$n bs=131072 count=1 2>/dev/null | tr -d '\000' | sed -n 's/.*X_TP_PreSharedKey val=\([^ \/>]*\).*/\1/p' | head -n1)"
+	case "$f" in
+	*[![:graph:]]*|"") return 1 ;;
+	esac
+	[ "${#f}" -ge 8 ] && [ "${#f}" -le 63 ] || return 1
+	printf '%s' "$f"
+}
+
+random_wifi_key() {
+	head -c 256 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 10
+}
+
+wifikey="$(wifi_key_from_config)"
+[ -n "$wifikey" ] || wifikey="$(random_wifi_key)"
+
+mac="$(cat /sys/class/net/eth0/address 2>/dev/null)"
+suffix="$(printf '%s' "$mac" | awk -F: 'NF==6{print toupper($5$6)}')"
+[ -n "$suffix" ] || exit 1
+
+# Enable every radio, set country TR, and put the 5 GHz radio on channel 40.
+for r in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
+	uci set wireless.$r.country='TR'
+	uci -q delete wireless.$r.disabled
+	case "$(uci -q get wireless.$r.band)" in
+	5g|5G|5ghz)
+		uci set wireless.$r.channel='40'
+		uci set wireless.$r.htmode='VHT80'
+		;;
+	esac
+done
+
+# Set SSID/key on every AP interface, band-specific name.
+for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+	dev="$(uci -q get wireless.$s.device)"
+	case "$(uci -q get wireless.$dev.band)" in
+	5g|5G|5ghz) ssid="ArcherC5v-${suffix}_OpenWrt_5GHz" ;;
+	*)          ssid="ArcherC5v-${suffix}_OpenWrt_2.4GHz" ;;
+	esac
+	uci set wireless.$s.mode='ap'
+	uci set wireless.$s.ssid="$ssid"
+	# WPA2-PSK varsayılan: bazı telefonlar WPA3/SAE karışık modda sorun çıkarıyor.
+	# WPA3 kullanıcı isterse arayüzden açabilir.
+	uci set wireless.$s.encryption='psk2'
+	uci set wireless.$s.key="$wifikey"
+	uci -q delete wireless.$s.disabled
+done
+
+uci commit wireless
+
+# Mark provisioning complete (only reached after a full, successful apply; a
+# Wi-Fi retry above exits non-zero and leaves the marker unset so it re-runs).
+uci -q set system.@system[0].c5v_provisioned='1'
+uci -q commit system
+exit 0

@@ -1,0 +1,69 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: SEARCH_MISS=FORWARD and bind from UN_HIT (stop auto-bind race)
+
+With the engine's IPv4 hash now computed in software, the FORWARD_BUILD search
+miss action is actively harmful: it auto-binds every miss to the engine's own
+entry at the same hash slot, racing and overwriting the driver-built BIND. On
+hardware this showed as bound>30 commits but only ~3 surviving in the table and
+crsn 0f never settling, so throughput stayed below the software flowtable. A
+live A/B (devmem TB_CFG) confirmed it: under FORWARD the garbage auto-binds
+vanish and a driver ipv4-hnapt BIND (ib1=0x214001xx) survives with the correct
+tuple.
+
+Switch SEARCH_MISS to FORWARD (no auto-bind) and commit from UN_HIT (crsn 0x0d)
+as well, since under FORWARD that is the normal miss reason and the slot comes
+from the tuple hash, not the descriptor. The driver BIND now sticks and the
+engine hits it on the next packet.
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -366,18 +366,19 @@
+ 	      EN75_PPE_TB_CFG_AGE_TCP |
+ 	      EN75_PPE_TB_CFG_AGE_UDP |
+ 	      EN75_PPE_TB_CFG_AGE_TCP_FIN |
+-	      /* FORWARD_BUILD (mainline mtk_ppe): on a search miss the engine
+-	       * auto-learns an UNBIND entry at its real hash slot and reports
+-	       * that slot in the descriptor. Committing the driver-built entry
+-	       * at that exact slot guarantees "where we write" == "where the
+-	       * engine searches" (incl. hash-collision resolution). Plain
+-	       * FORWARD reports a hash that need not be the search slot -> a
+-	       * valid BIND entry then never hits. (The "FORWARD_BUILD learns
+-	       * 6rd/dslite garbage" symptom was a big-endian display artifact
+-	       * of correct little-endian entries; fixed in the FOE LE patch.)
++	      /* FORWARD: on a search miss the engine punts the packet to the CPU
++	       * (crsn UN_HIT) WITHOUT auto-binding anything. We now compute the
++	       * engine's exact hash slot in software (en75_ppe_ipv4_hash_slot,
++	       * verified 30/30 on hardware) and write the BIND there, so the
++	       * descriptor hint is no longer needed. FORWARD_BUILD was actively
++	       * harmful: it auto-bound every miss to its own entry at the same
++	       * hash slot, racing and overwriting the driver-built BIND (observed:
++	       * bound>30 committed but only ~3 survived in the table, 0f never
++	       * settling). With FORWARD there is no auto-bind to fight, so our
++	       * BIND sticks and the engine hits it on the next packet.
+ 	       */
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_SEARCH_MISS,
+-			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD_BUILD) |
++			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_KEEPALIVE,
+ 			 EN75_PPE_KEEPALIVE_DISABLE) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_HASH_MODE, 1) |
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -217,12 +217,13 @@
+ 	}
+ 
+ 	switch (get_erx_crsn(&desc.msg.erx)) {
++	case 0x0d:	/* UN_HIT: search miss. Under SEARCH_MISS=FORWARD the engine
++			 * does not auto-learn, so this is the normal path for a
++			 * not-yet-bound flow. The offload code computes the engine
++			 * hash slot from the tuple itself (no descriptor hint), so
++			 * binding from UN_HIT is correct and necessary now. */
+ 	case 0x0e:	/* HIT_UNBIND: an UNBIND entry exists for this flow. */
+-	case 0x0f:	/* HIT_UNBIND_RATE_REACHED: the engine wants this flow bound.
+-			 * Try to bind on both: the offload code scans for the
+-			 * engine's learned slot, but rate-limits the (expensive)
+-			 * scan per flow so the CPU is not saturated. 0x0d (UN_HIT,
+-			 * before the engine has learned) stays on the slow path. */
++	case 0x0f:	/* HIT_UNBIND_RATE_REACHED: the engine wants this flow bound. */
+ 		en75_ppe_offload_rx_commit(en75_eth_ppe(q->qdma->eth), skb, hash);
+ 		break;
+ 	case 0x16: {	/* HIT_BIND_FORCE_CPU: a bound entry was hit. Log once

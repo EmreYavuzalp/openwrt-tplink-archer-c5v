@@ -1,0 +1,30 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: DIAG log the eth-mangle actions and built L2 MACs
+
+Live devmem dump of a committed BIND showed the dest MAC rewrite as
+00:00:00:00:b6:41 - the top 4 bytes (the offset-0 eth mangle) are zero, so a
+bound flow forwards to a bogus next hop. Log each eth mangle action
+(offset/mask/val) and the assembled h_dest/h_source so the exact failing
+write is visible on hardware before fixing the (endian-sensitive) mangle.
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -208,6 +208,9 @@
+ 	void *dest = eth + act->mangle.offset;
+ 	const void *src = &act->mangle.val;
+ 
++	pr_info_ratelimited("econet-eth: ETHMANGLE off=%u mask=%08x val=%08x\n",
++			    act->mangle.offset, act->mangle.mask, act->mangle.val);
++
+ 	if (act->mangle.offset > 8)
+ 		return;
+ 
+@@ -362,6 +365,9 @@
+ 		}
+ 	}
+ 
++	pr_info_ratelimited("econet-eth: L2DIAG dst=%pM src=%pM\n",
++			    data.eth.h_dest, data.eth.h_source);
++
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+ 		return -EINVAL;

@@ -1,0 +1,54 @@
+From: OpenAI Codex <codex@local>
+Subject: econet-eth: stop delayed MT7530 reapply once RX works
+
+The delayed Archer C5v MT7530/TRGMII reapply sequence is destructive: it forces
+the TRGMII CPU ports down while resynchronising the pads. That is useful while
+recovering a no-RX boot, but unnecessary after traffic has already crossed the
+path and can briefly disturb connected clients.
+
+Before each delayed attempt, check the registered GDM netdev stats. If any RX
+packet has been observed, stop the remaining retries. This keeps the cold-boot
+recovery window for dead boots while avoiding avoidable link disruption on
+successful boots.
+---
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -789,6 +789,24 @@
+ 	}
+ }
+ 
++static bool en75_ext_switch_rx_seen(struct en75_eth_pvt *eth)
++{
++	struct rtnl_link_stats64 stats;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
++		if (!eth->ports[i])
++			continue;
++
++		memset(&stats, 0, sizeof(stats));
++		dev_get_stats(eth->ports[i], &stats);
++		if (stats.rx_packets)
++			return true;
++	}
++
++	return false;
++}
++
+ static void en75_ext_switch_reapply_work(struct work_struct *work)
+ {
+ 	struct delayed_work *dwork = to_delayed_work(work);
+@@ -797,6 +815,13 @@
+ 	unsigned int attempt = eth->mt7530_reapply_count + 1;
+ 	int err;
+ 
++	if (en75_ext_switch_rx_seen(eth)) {
++		dev_info(eth->pub.dev,
++			 "MT7530 RX traffic seen, stopping delayed TRGMII/VLAN reapply\n");
++		eth->mt7530_reapply_count = EN75_MT7530_REAPPLY_MAX;
++		return;
++	}
++
+ 	err = en75_trgmii_resync(eth);
+ 	if (err)
+ 		dev_warn(eth->pub.dev,

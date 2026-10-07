@@ -1,0 +1,52 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: log HNAPT new tuple and ib2 on commit/re-miss
+
+Orig tuple matches skb but hardware still UN_HIT. Extend debug to dump the
+NAT rewrite (new) side and ib2 egress port so we can see empty/wrong rewrite
+data without racing FOE aging to inspect slots live.
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -554,23 +554,29 @@
+ 			entry->state = EN75_FLOW_COMMITTED;
+ 			if (atomic_dec_if_positive(&cdbg) >= 0) {
+ 				struct en75_ipv4_tuple *o = &e.ipv4.orig;
++				struct en75_ipv4_tuple *n = &e.ipv4.new;
+ 
+ 				pr_info("econet-eth: PPE commit hw_slot=%u skb %pI4:%u->%pI4:%u "
+-					"foe-orig %08x/%08x/%08x\n",
++					"orig %08x/%08x/%08x new %08x/%08x/%08x ib2=%08x\n",
+ 					hw_slot,
+ 					&key.src[0], ntohs(key.sport),
+ 					&key.dst[0], ntohs(key.dport),
+-					o->src_ip, o->dest_ip, o->ports);
++					o->src_ip, o->dest_ip, o->ports,
++					n->src_ip, n->dest_ip, n->ports,
++					e.ipv4.ib2);
+ 			}
+ 		} else if (entry->state == EN75_FLOW_COMMITTED) {
+ 			static atomic_t dbg = ATOMIC_INIT(32);
+ 			struct en75_ipv4_tuple *o;
+ 
+ 			if (atomic_dec_if_positive(&dbg) >= 0) {
+-				o = &ppe->foe[entry->hash].ipv4.orig;
++				struct en75_foe_ipv4 *v4 = &ppe->foe[entry->hash].ipv4;
++				struct en75_ipv4_tuple *n = &v4->new;
++
++				o = &v4->orig;
+ 				pr_info("econet-eth: re-miss committed=%u hw_slot=%u "
+ 					"state=%u ib1@%u=%08x skb %pI4:%u->%pI4:%u "
+-					"foe-orig %08x/%08x/%08x%s\n",
++					"orig %08x/%08x/%08x new %08x/%08x/%08x ib2=%08x%s\n",
+ 					entry->hash, hw_slot,
+ 					(u32)FIELD_GET(EN75_FOE_IB1_STATE, ppe->foe[entry->hash].ib1),
+ 					entry->hash,
+@@ -578,6 +584,8 @@
+ 					&key.src[0], ntohs(key.sport),
+ 					&key.dst[0], ntohs(key.dport),
+ 					o->src_ip, o->dest_ip, o->ports,
++					n->src_ip, n->dest_ip, n->ports,
++					v4->ib2,
+ 					hw_slot != entry->hash ?
+ 					" SLOT-MISMATCH" : "");
+ 			}

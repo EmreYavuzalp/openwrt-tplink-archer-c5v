@@ -1,0 +1,60 @@
+. /lib/functions/system.sh
+. /lib/functions/uci-defaults.sh
+. /lib/functions/econet.sh
+
+econet_setup_interfaces()
+{
+	local board="$1"
+
+	case "$board" in
+	tplink,archer-c5v)
+		# external MT7530 driven as a VLAN-aware switch by econet-eth:
+		#   LAN ports -> VID 1  (eth0.1)
+		#   WAN port  -> VID 35 (eth0.35, tagged) for ISP PPPoE-over-VLAN
+		# The CPU port (6) must be in MT7530 SECURITY mode (econet-eth patch
+		# 100) so VID35-tagged egress actually carries the tag on the wire.
+		# Set credentials after flashing:
+		#   uci set network.wan.username='<ISP user>'
+		#   uci set network.wan.password='<ISP pass>'; uci commit network; ifup wan
+		ucidef_set_interface_lan "eth0.1"
+		ucidef_set_interface "wan" device "eth0.35" protocol "pppoe"
+		;;
+	*)
+		# econet lacks DSA support now
+		ucidef_set_interface_lan "eth0"
+		;;
+	esac
+}
+
+econet_setup_macs()
+{
+	local board="$1"
+	local lan_mac=""
+	local wan_mac=""
+	local label_mac=""
+
+	case "$board" in
+	chinamobile,gs3101)
+		wan_mac="$(get_mac_gs3101)"
+		[ -n "$wan_mac" ] && lan_mac="$(macaddr_add $wan_mac 1)"
+		;;
+	huawei,hg2821t-u)
+		local conffile="/tmp/configuration_a/factory.conf"
+		lan_mac=$(get_mac_ascii "$conffile" brmac)
+		wan_mac=$(get_mac_ascii "$conffile" internetmac)
+		label_mac=$wan_mac
+		;;
+	esac
+
+	[ -n "$lan_mac" ] && ucidef_set_interface_macaddr "lan" "$lan_mac"
+	[ -n "$wan_mac" ] && ucidef_set_interface_macaddr "wan" "$wan_mac"
+	[ -n "$label_mac" ] && ucidef_set_label_macaddr "$label_mac"
+}
+
+board_config_update
+board=$(board_name)
+econet_setup_interfaces $board
+econet_setup_macs $board
+board_config_flush
+
+exit 0

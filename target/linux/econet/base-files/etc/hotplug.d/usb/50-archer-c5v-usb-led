@@ -1,0 +1,28 @@
+#!/bin/sh
+# TP-Link Archer C5v: drive the front-panel USB LED (blue:usb) from USB device
+# presence. The image ships without kmod-usb-ledtrig-usbport, so instead of the
+# in-kernel usbport trigger we recompute the LED on every USB hotplug event:
+# lit while at least one real (non-root-hub) USB device is attached, off
+# otherwise. Handles boot (root hubs only -> off), plug -> on, unplug -> off.
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "tplink,archer-c5v" ] || exit 0
+
+led=$(ls -d /sys/class/leds/*:usb 2>/dev/null | head -1)
+[ -n "$led" ] || exit 0
+
+present=0
+for v in /sys/bus/usb/devices/*/idVendor; do
+	[ -e "$v" ] || continue
+	# skip Linux Foundation root hubs (1d6b)
+	[ "$(cat "$v" 2>/dev/null)" = "1d6b" ] && continue
+	present=1
+	break
+done
+
+if [ "$present" = 1 ]; then
+	echo 255 > "$led/brightness" 2>/dev/null
+else
+	echo 0 > "$led/brightness" 2>/dev/null
+fi
+
+exit 0

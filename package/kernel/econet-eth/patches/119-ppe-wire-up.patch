@@ -1,0 +1,187 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: wire up the PPE/FOE hardware offload (stage 2)
+
+Build the recovered PPE sources and hook them into the driver: include
+econet_ppe.h, add the en75_ppe handle to the private struct, init/start the
+PPE in probe and enable PPE forwarding on each GDM port, stop it on remove,
+and commit staged FOE entries from the QDMA RX path on the engine's
+learn/unbind completion reasons (crsn 0x0d/0e/0f), logging the first bound
+hit (crsn 0x16). Until flows bind the PPE punts everything to the CPU, so
+ behaviour is functionally unchanged.
+diff -ruN '--exclude=*.orig' a/econet_eth.h b/econet_eth.h
+--- a/econet_eth.h	2026-06-28 12:04:02.467507058 +0300
++++ b/econet_eth.h	2026-06-28 12:09:59.347886392 +0300
+@@ -207,6 +207,10 @@
+ 				       enum etx_fport fport,
+ 				       bool has_g2_stats);
+ 
++struct en75_ppe;
++struct en75_ppe *en75_eth_ppe(struct en75_eth *eth);
++void en75_port_enable_ppe_fwd(struct net_device *dev, struct en75_ppe *ppe);
++
+ #define en75_rreg(reg) __extension__({ \
+ 		BUILD_BUG_ON(sizeof(*(reg)) != sizeof(u32)); \
+ 		union { typeof(*(reg)) v; u32 w; } __r = { .w = readl(reg) }; \
+diff -ruN '--exclude=*.orig' a/econet_eth.c b/econet_eth.c
+--- a/econet_eth.c	2026-06-28 12:04:02.467507058 +0300
++++ b/econet_eth.c	2026-06-28 12:09:59.347886392 +0300
+@@ -42,6 +42,7 @@
+ #include <linux/workqueue.h>
+ 
+ #include "gdm_regs.h"
++#include "econet_ppe.h"
+ #include "linux/dev_printk.h"
+ #include "linux/ioport.h"
+ #include "linux/mdio.h"
+@@ -177,6 +178,7 @@
+ 	int				qdma_irq[EN75_NUM_QDMA * QDMA_NUM_IRQS];
+ 	struct en75_qdma		*qdma[EN75_NUM_QDMA];
+ 	struct en75_debug		*debug;
++	struct en75_ppe			*ppe;
+ 	struct delayed_work		mt7530_reapply_work;
+ 	unsigned int			mt7530_reapply_count;
+ };
+@@ -923,6 +925,13 @@
+ 	}
+ }
+ 
++struct en75_ppe *en75_eth_ppe(struct en75_eth *eth)
++{
++	struct en75_eth_pvt *ep = (struct en75_eth_pvt *) eth;
++
++	return ep->ppe;
++}
++
+ int en75_rx_before_recv(struct en75_eth *eth, struct sk_buff *skb,
+ 			enum etx_fport sport)
+ {
+@@ -1053,6 +1062,8 @@
+ 
+ 	cancel_delayed_work_sync(&eth->mt7530_reapply_work);
+ 
++	en75_ppe_stop(eth->ppe);
++
+ 	en75_debugfs_exit(eth->debug);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+@@ -1163,6 +1174,21 @@
+ 
+ 	eth->debug = en75_debugfs_init(&debug_conf);
+ 
++	/* The PPE is optional: if it cannot be brought up (e.g. the FOE
++	 * table allocation fails) carry on without hardware offload rather
++	 * than failing the whole device. */
++	eth->ppe = en75_ppe_init(&pdev->dev, eth->regs->ppe, eth->regs->fe);
++	if (IS_ERR(eth->ppe)) {
++		dev_warn(&pdev->dev, "PPE init failed (%pe), offload disabled\n",
++			 eth->ppe);
++		eth->ppe = NULL;
++	} else {
++		en75_ppe_start(eth->ppe);
++		for (i = 0; i < ARRAY_SIZE(eth->ports); i++)
++			if (eth->ports[i])
++				en75_port_enable_ppe_fwd(eth->ports[i], eth->ppe);
++	}
++
+ 	/* Configure the internal GSW as a dumb switch between GDM and TRGMII. */
+ 	en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(5) / 4]);
+ 	en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(6) / 4]);
+diff -ruN '--exclude=*.orig' a/econet_port.c b/econet_port.c
+--- a/econet_port.c	2026-06-28 12:04:02.467507058 +0300
++++ b/econet_port.c	2026-06-28 12:09:59.347886392 +0300
+@@ -12,8 +12,11 @@
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/of_net.h>
++#include <net/flow_offload.h>
++#include <net/pkt_cls.h>
+ 
+ #include "econet_eth.h"
++#include "econet_ppe.h"
+ #include "gdm_regs.h"
+ #include "qdma_desc.h"
+ 
+@@ -57,6 +60,9 @@
+ 	/* Protects accesses to hardware regs */
+ 	spinlock_t reg_lock;
+ 
++	/* PPE engine for flow-table offload; NULL if offload is off. */
++	struct en75_ppe *ppe;
++
+ 	struct en75_hw_stats stats;
+ 
+ 	// DECLARE_BITMAP(qos_sq_bmap, AIROHA_NUM_QOS_CHANNELS);
+@@ -126,6 +132,25 @@
+ 	en75_wreg(fc, &port->regs->fwd_cfg);
+ }
+ 
++/*
++ * Route routed/NAT traffic to the PPE for hardware offload. Until flows are
++ * bound the PPE misses every packet and punts it to the CPU, so behaviour is
++ * functionally unchanged. Called from probe once the PPE has been started.
++ */
++void en75_port_enable_ppe_fwd(struct net_device *dev, struct en75_ppe *ppe)
++{
++	struct en75_gdm_port *port = netdev_priv(dev);
++	struct fwd_cfg fc;
++
++	port->ppe = ppe;
++
++	guard(spinlock)(&port->reg_lock);
++	fc = en75_rreg(&port->regs->fwd_cfg);
++	set_gdm_fwd_cfg_mymac_fport(&fc, ETX_FPORT_PPE);
++	set_gdm_fwd_cfg_default_fport(&fc, ETX_FPORT_PPE);
++	en75_wreg(fc, &port->regs->fwd_cfg);
++}
++
+ static int en75_dev_init(struct net_device *dev)
+ {
+ 	struct en75_gdm_port *port = netdev_priv(dev);
+diff -ruN '--exclude=*.orig' a/econet_qdma.c b/econet_qdma.c
+--- a/econet_qdma.c	2026-06-28 12:04:02.467507058 +0300
++++ b/econet_qdma.c	2026-06-28 12:09:59.347886392 +0300
+@@ -16,6 +16,7 @@
+ #include "qdma_desc.h"
+ #include "qdma_regs.h"
+ #include "econet_eth.h"
++#include "econet_ppe.h"
+ 
+ /* The non-dma part of RX packet descriptor */
+ struct en75_q_rx_ent {
+@@ -202,8 +203,25 @@
+ 	skb_set_hash(skb, jhash_1word(hash, 0),
+ 		     PKT_HASH_TYPE_L4);
+ 
+-	/* TODO: When we begin supporting the PPE, we will handle
+-	 *       PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED here. */
++	switch (get_erx_crsn(&desc.msg.erx)) {
++	case 0x0d:	/* UN_HIT */
++	case 0x0e:	/* HIT_UNBIND */
++	case 0x0f:	/* HIT_UNBIND_RATE_REACHED: under FORWARD_BUILD these carry
++			 * the engine's real learned slot; publish the staged entry. */
++		en75_ppe_offload_rx_commit(en75_eth_ppe(q->qdma->eth), skb, hash);
++		break;
++	case 0x16: {	/* HIT_BIND_FORCE_CPU: a bound entry was hit. Log once
++			 * so the offload path can be confirmed on hardware. */
++		static bool en75_ppe_hit_logged;
++
++		if (!READ_ONCE(en75_ppe_hit_logged)) {
++			WRITE_ONCE(en75_ppe_hit_logged, true);
++			pr_info("econet-eth: PPE offload first bound-flow hit at slot %u\n",
++				hash);
++		}
++		break;
++	}
++	}
+ 
+ 	sport = get_erx_sport(&desc.msg.erx);
+ 	if (en75_rx_before_recv(q->qdma->eth, skb, sport))
+diff -ruN '--exclude=*.orig' a/Kbuild b/Kbuild
+--- a/Kbuild	2026-06-28 12:04:02.467507058 +0300
++++ b/Kbuild	2026-06-28 12:09:59.347886392 +0300
+@@ -1,2 +1,2 @@
+ obj-m := econet-eth.o
+-econet-eth-y := econet_eth.o econet_eth_debug.o econet_qdma.o econet_port.o
+\ Dosya sonunda yenisatır yok
++econet-eth-y := econet_eth.o econet_eth_debug.o econet_qdma.o econet_port.o econet_ppe.o econet_foe.o econet_ppe_offload.o
+\ Dosya sonunda yenisatır yok

@@ -1,0 +1,109 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: poll RX NAPI with a short watchdog timer
+
+The TX completion path already needs a hrtimer because QDMA done-queue
+interrupts are not delivered promptly and otherwise fall back to the
+10 ms timer tick. Wired LAN pings to the router still show the same
+jiffy-shaped sawtooth after disabling threaded NAPI:
+
+    ~10-11 ms, 9 ms, ... 1-2 ms, then jump back to ~10-11 ms
+
+This happens for both small and 1400-byte ICMP packets. Disabling
+threaded NAPI removed the large-packet loss, but did not remove the
+periodic latency. That points at the RX side still waiting for a late
+QDMA interrupt before the echo request is delivered to the stack.
+
+Add an experimental 1 ms RX watchdog hrtimer while QDMA is in use. It
+schedules RX NAPI even if the hardware IRQ is delayed. This is a
+latency diagnostic patch, not a final low-power design: if it removes
+the 10 ms sawtooth, the remaining work is to find the real RX interrupt
+or coalescing register that makes the timer unnecessary.
+
+--- a/econet_qdma.c	2026-06-26 16:58:57.785578446 +0300
++++ b/econet_qdma.c	2026-06-26 16:59:21.640379799 +0300
+@@ -38,6 +38,9 @@
+ 	int				buf_size;
+ 	struct napi_struct		napi;
+ 	struct page_pool		*page_pool;
++
++	/* Experimental RX latency watchdog, see en75_rx_kick(). */
++	struct hrtimer			kick;
+ };
+ 
+ /* The non-dma part of TX packet descriptor */
+@@ -461,6 +464,33 @@
+ 			      HRTIMER_MODE_REL);
+ }
+ 
++/* RX DONE interrupts can be delayed until an unrelated timer interrupt runs
++ * the shared handler, producing a 10 ms sawtooth in host-terminated ping
++ * latency. Poll RX shortly while the QDMA engine is in use so echo requests
++ * are delivered to the stack without waiting for the jiffy tick.
++ */
++#define EN75_RX_KICK_NS		1000000
++
++static enum hrtimer_restart en75_rx_kick(struct hrtimer *t)
++{
++	struct en75_q_rx *q = container_of(t, struct en75_q_rx, kick);
++	struct en75_qdma *qdma = q->qdma;
++
++	if (!READ_ONCE(qdma->users) || READ_ONCE(qdma->destroying))
++		return HRTIMER_NORESTART;
++
++	napi_schedule(&q->napi);
++	hrtimer_forward_now(t, ns_to_ktime(EN75_RX_KICK_NS));
++
++	return HRTIMER_RESTART;
++}
++
++static void en75_rx_kick_start(struct en75_q_rx *q)
++{
++	hrtimer_start(&q->kick, ns_to_ktime(EN75_RX_KICK_NS),
++		      HRTIMER_MODE_REL);
++}
++
+ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
+ {
+ 	struct qregs_doneq_state state;
+@@ -705,6 +735,9 @@
+ 
+ 	netif_napi_add(qdma->napi_dev, &q->napi, en75_qdma_rx_napi_poll);
+ 
++	hrtimer_setup(&q->kick, en75_rx_kick,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++
+ 	en75_wreg(dma_addr, &q->qchain_regs->rxbase);
+ 	
+ 	/* en75_fill_rx_queue fills everything from current cpu index + 1 up to
+@@ -1104,6 +1137,7 @@
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+ 		struct en75_q_rx *q = &qdma->q_rx[i];
+ 		en75_qdma_destroy_rxq_locked(q);
++		hrtimer_cancel(&q->kick);
+ 		netif_napi_del(&q->napi);
+ 	}
+ 
+@@ -1146,8 +1180,10 @@
+ 	set_qregs_qcfg_tx_dma_en(&qcfg, true);
+ 	en75_wreg(qcfg, &qdma->regs->qdma_cfg);
+ 
+-	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++)
++	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+ 		napi_enable(&qdma->q_rx[i].napi);
++		en75_rx_kick_start(&qdma->q_rx[i]);
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++)
+ 		napi_enable(&qdma->q_tx_done[i].napi);
+@@ -1170,8 +1206,10 @@
+ 	set_qregs_qcfg_tx_dma_en(&qcfg, false);
+ 	en75_wreg(qcfg, &qdma->regs->qdma_cfg);
+ 
+-	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++)
++	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
++		hrtimer_cancel(&qdma->q_rx[i].kick);
+ 		napi_disable(&qdma->q_rx[i].napi);
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++) {
+ 		hrtimer_cancel(&qdma->q_tx_done[i].kick);

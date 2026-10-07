@@ -1,0 +1,54 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: enable hardware TX checksum generation
+
+The QDMA TX message has always carried the ICO/UCO/TCO checksum-enable
+bits (the accessors existed, unused) and the port comment noted csum
+offload as "supported but disabled for simplicity". Every CPU-path
+packet - Wi-Fi forwarding, tunnels, locally originated traffic - was
+paying for a software checksum pass over the payload on a 900 MHz
+single-issue core.
+
+Advertise NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM and set all three enables
+for CHECKSUM_PARTIAL skbs; the hardware applies the ones matching the
+parsed packet (same convention as mtk_eth_soc's TX_DMA_CHKSUM). The PPE
+path is unaffected (bound flows never reach the CPU), TSO stays off
+(not implemented on EN751221).
+--- a/econet_port.c	2026-07-03 13:47:29.087946793 +0300
++++ b/econet_port.c	2026-07-03 13:47:29.115945274 +0300
+@@ -249,6 +249,16 @@
+ 	set_etx_queue(&msg.etx, qid % EN75_NUM_QUEUES);
+ 	set_etx_fport(&msg.etx, port->fport);
+ 
++	/* The QDMA generates the IP/TCP/UDP checksums on demand (the ICO/
++	 * UCO/TCO enables in the TX message). Setting all three is safe:
++	 * the hardware only applies the ones matching the parsed packet,
++	 * the same convention mtk_eth_soc uses for TX_DMA_CHKSUM. */
++	if (skb->ip_summed == CHECKSUM_PARTIAL) {
++		set_etx_ico(&msg.etx, true);
++		set_etx_uco(&msg.etx, true);
++		set_etx_tco(&msg.etx, true);
++	}
++
+ 	txq = netdev_get_tx_queue(dev, qid);
+ 
+ 	/* Non-linear skbs are unsupported, we shouldn't get them but
+@@ -506,14 +516,16 @@
+ 	 * NETIF_F_TSO | NETIF_F_TSO6:
+ 	 *   - Supported in EN751627, not in EN751221, not used in forwarding.
+ 	 *
+-	 * NETIF_F_IP_CSUM | NETIF_F_RXCSUM | NETIF_F_IPV6_CSUM:
+-	 *   - Supported but disabled for simplicity.
++	 * NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM:
++	 *   - TX checksum generation via the ICO/UCO/TCO enables in the TX
++	 *     message. Matters for the CPU path (Wi-Fi forwarding, tunnels,
++	 *     locally originated traffic); the PPE path never sees the CPU.
+ 	 *
+ 	 * NETIF_F_HW_TC:
+ 	 *   - TODO: When we get the PPE working, we will enable this for
+ 	 *           TC_SETUP_BLOCK / TC_SETUP_FT for NAT flow-table offloading.
+ 	 */
+-	ndev->hw_features = 0;
++	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
+ 
+ 	ndev->features |= ndev->hw_features;
+ 	ndev->vlan_features = ndev->hw_features;

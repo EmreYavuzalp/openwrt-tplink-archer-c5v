@@ -1,0 +1,133 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: compute the engine slot from the descriptor (O(1), drop scan)
+
+The bind logs revealed the descriptor was telling us the slot all along, just
+scaled: real_slot = hw_slot * 2 / 5 (engine slot 16/2736/1776/1804 vs descriptor
+hw_slot 40/6840/4440/4510 - exactly x2.5, because the ppe_entry field counts in
+32-byte units and a FOE entry is 80 bytes). The full-table scan was only needed
+because we did not know this relation; under a many-flow speed test the scan ran
+in softirq for every unbound flow and pinned the CPU at 75% sirq / 0% idle.
+
+Compute the slot directly and verify the one candidate; fall back to the scan
+only if it does not match (rare). This makes binding O(1) and frees the CPU so
+bound flows actually reach line rate.
+
+diff -ruN b133/econet_ppe_offload.c b134/econet_ppe_offload.c
+--- a/econet_ppe_offload.c	2026-06-29 23:47:35.200146752 +0300
++++ b/econet_ppe_offload.c	2026-06-29 23:48:08.846331453 +0300
+@@ -537,47 +537,70 @@
+  * Scan for that entry by matching the ingress tuple, and bind it in place.
+  * @want is host byte order; the live table is little-endian.
+  */
+-static int en75_ppe_find_engine_slot(struct en75_ppe *ppe,
+-				     const struct en75_foe_entry *want)
++/* True if the UNBIND entry the engine learned at slot @i matches @want. */
++static bool en75_ppe_slot_matches(struct en75_ppe *ppe, u32 i,
++				  const struct en75_foe_entry *want)
+ {
+ 	u32 type = FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, want->ib1);
+-	u32 i;
++	u32 ib1;
+ 
+-	for (i = 0; i < EN75_PPE_ENTRIES; i++) {
+-		u32 ib1 = le32_to_cpu(READ_ONCE(ppe->foe[i].ib1));
++	if (i >= EN75_PPE_ENTRIES)
++		return false;
+ 
+-		if (FIELD_GET(EN75_FOE_IB1_STATE, ib1) != EN75_FOE_STATE_UNBIND)
+-			continue;
+-		if (FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1) != type)
+-			continue;
+-
+-		if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT ||
+-		    type == EN75_PPE_PKT_TYPE_IPV4_ROUTE) {
+-			const struct en75_ipv4_tuple *w = &want->ipv4.orig;
+-			const struct en75_ipv4_tuple *h = &ppe->foe[i].ipv4.orig;
+-
+-			if (le32_to_cpu(h->src_ip)  == w->src_ip &&
+-			    le32_to_cpu(h->dest_ip) == w->dest_ip &&
+-			    le32_to_cpu(h->ports)   == w->ports)
+-				return i;
+-		} else if (type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T ||
+-			   type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T) {
+-			const struct en75_foe_ipv6 *w = &want->ipv6;
+-			const struct en75_foe_ipv6 *h = &ppe->foe[i].ipv6;
+-			bool ok = true;
+-			int j;
+-
+-			for (j = 0; j < 4; j++)
+-				if (le32_to_cpu(h->src_ip[j])  != w->src_ip[j] ||
+-				    le32_to_cpu(h->dest_ip[j]) != w->dest_ip[j])
+-					ok = false;
+-			if (type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T &&
+-			    le32_to_cpu(h->ports) != w->ports)
+-				ok = false;
+-			if (ok)
+-				return i;
+-		}
++	ib1 = le32_to_cpu(READ_ONCE(ppe->foe[i].ib1));
++	if (FIELD_GET(EN75_FOE_IB1_STATE, ib1) != EN75_FOE_STATE_UNBIND)
++		return false;
++	if (FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1) != type)
++		return false;
++
++	if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT ||
++	    type == EN75_PPE_PKT_TYPE_IPV4_ROUTE) {
++		const struct en75_ipv4_tuple *w = &want->ipv4.orig;
++		const struct en75_ipv4_tuple *h = &ppe->foe[i].ipv4.orig;
++
++		return le32_to_cpu(h->src_ip)  == w->src_ip &&
++		       le32_to_cpu(h->dest_ip) == w->dest_ip &&
++		       le32_to_cpu(h->ports)   == w->ports;
++	}
++	if (type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T ||
++	    type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++		const struct en75_foe_ipv6 *w = &want->ipv6;
++		const struct en75_foe_ipv6 *h = &ppe->foe[i].ipv6;
++		int j;
++
++		for (j = 0; j < 4; j++)
++			if (le32_to_cpu(h->src_ip[j])  != w->src_ip[j] ||
++			    le32_to_cpu(h->dest_ip[j]) != w->dest_ip[j])
++				return false;
++		if (type == EN75_PPE_PKT_TYPE_IPV6_ROUTE_5T &&
++		    le32_to_cpu(h->ports) != w->ports)
++			return false;
++		return true;
+ 	}
++	return false;
++}
++
++/*
++ * The slot the engine actually searches. The RX descriptor's ppe_entry field
++ * reports the matching FOE entry scaled by 80/32 = 2.5 (the engine counts in
++ * 32-byte units while an entry is 80 bytes), so the real index is hw_slot*2/5.
++ * Verified on hardware: hw_slot 40->16, 6840->2736, 4440->1776, 4510->1804.
++ * This is O(1); the full table scan is only a fallback for the rare case the
++ * scaled value does not divide cleanly or the entry is not where expected.
++ */
++static int en75_ppe_find_engine_slot(struct en75_ppe *ppe,
++				     const struct en75_foe_entry *want,
++				     u32 hw_slot)
++{
++	u32 i;
++
++	i = (hw_slot * 2) / 5;
++	if (en75_ppe_slot_matches(ppe, i, want))
++		return i;
++
++	for (i = 0; i < EN75_PPE_ENTRIES; i++)
++		if (en75_ppe_slot_matches(ppe, i, want))
++			return i;
+ 
+ 	return -1;
+ }
+@@ -612,7 +635,7 @@
+ 		 * foe_lock (IRQ-off) across it blocked NAPI long enough to drop
+ 		 * packets and collapse TCP. The commit below re-checks the state
+ 		 * under the lock, so a racy read here only risks a retry. */
+-		slot = en75_ppe_find_engine_slot(ppe, &entry->foe);
++		slot = en75_ppe_find_engine_slot(ppe, &entry->foe, hw_slot);
+ 		if (slot >= 0) {
+ 			spin_lock_irqsave(&ppe->foe_lock, flags);
+ 			if (entry->state == EN75_FLOW_PENDING) {

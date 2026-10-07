@@ -1,0 +1,59 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: wake all TX queues on completion, fix permanent stall
+
+The netdev registers 256 soft TX queues that all feed one shared
+hardware TX ring (128 descriptors). When the ring is full,
+en75_dev_xmit stops the soft queue that hit -EBUSY. But the completion
+handler only wakes the queue each completed skb was originally sent
+from. A queue that was stopped while the ring was filled by OTHER
+queues' packets never receives a completion of its own, so it is never
+woken: every flow hashed to it stalls permanently, and over time more
+and more queues strand until the interface looks dead. Only a reboot
+(queue state reset) recovers.
+
+This path was dormant before the BQL floor was raised (patch 103): BQL
+kept each queue at ~1 packet in flight, so the shared ring never
+filled and queues were never stopped. With the ring now actually being
+used, multi-flow traffic (e.g. NAT-forwarded speed tests) trips it
+within seconds.
+
+Wake all of the device's queues once per completion poll instead.
+en75_dev_xmit immediately re-stops any queue that still finds the ring
+full, so this cannot livelock; the per-skb conditional wake becomes
+redundant and is dropped.
+
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -431,6 +431,7 @@
+ 	struct en75_tx_doneq *done_q;
+ 	struct en75_qdma *qdma;
+ 	int id, irq_queued;
++	struct net_device *wake_dev = NULL;
+ 	u32 done = 0, head;
+ 
+ 	done_q = container_of(napi, struct en75_tx_doneq, napi);
+@@ -497,8 +498,7 @@
+ 		txq = netdev_get_tx_queue(skb->dev,
+ 					  skb_get_queue_mapping(skb));
+ 		netdev_tx_completed_queue(txq, 1, skb->len);
+-		if (netif_tx_queue_stopped(txq))
+-			netif_tx_wake_queue(txq);
++		wake_dev = skb->dev;
+ 
+ 		dev_kfree_skb_any(skb);
+ 	}
+@@ -514,6 +514,14 @@
+ 		en75_wreg(done & 0x7f, &qdma->regs->done_queue.pop_back);
+ 	}
+ 
++	/* The hardware TX ring is shared by all soft queues, but waking only
++	 * the queue a completed skb came from leaves every other queue that
++	 * was stopped on ring-full stopped forever: no completion ever maps
++	 * to it, so the flows hashed there stall permanently. Wake them all;
++	 * en75_dev_xmit re-stops queues while the ring is still full. */
++	if (wake_dev)
++		netif_tx_wake_all_queues(wake_dev);
++
+ 	if (done < budget && napi_complete(napi)) {
+ 		union en75_irq_purpose purpose = IRQ_PURPOSE(DONE, TX, id);
+ 		union irq_bit b = en751221_irq_bit(purpose);

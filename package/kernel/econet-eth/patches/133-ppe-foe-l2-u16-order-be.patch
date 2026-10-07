@@ -1,0 +1,55 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: fix L2 rewrite u16 field order for big-endian FOE table
+
+Single-stream iperf showed the offload path is lossy: a bound flow blackholes
+(TCP cwnd collapses to ~1.4 KB for ~25s, then recovers when the entry ages back
+to the CPU slow path), with the CPU 99% idle. The bound entry forwards in
+hardware but its rewritten L2 header is corrupt.
+
+Same big-endian hazard as the L4 ports word: __en75_ppe_foe_commit() byte-swaps
+the entry one 32-bit word at a time, which is correct for u32 fields but swaps
+the two halves of any word that packs two u16s. struct en75_foe_mac_info has
+three such words: {vlan1,etype}, {vlan2,dest_mac_lo} and {pppoe_id,src_mac_lo}.
+So dest_mac_lo ended up swapped with vlan2 - the low 2 bytes of the destination
+MAC were wrong - and the next hop dropped the frames.
+
+Declare each packed u16 pair in the order that yields the correct little-endian
+layout after the per-word swap on this big-endian SoC (the field destined for
+the low 16 bits is listed second). The builders use named fields, so only the
+struct declaration changes. Single u32 fields (dest_mac_hi/src_mac_hi) are
+already correct.
+
+diff -ruN b132/econet_foe.h b133/econet_foe.h
+--- a/econet_foe.h	2026-06-29 23:26:36.940022518 +0300
++++ b/econet_foe.h	2026-06-29 23:28:01.231476305 +0300
+@@ -73,19 +73,27 @@
+ #define EN75_FOE_IB2_DSCP		GENMASK(31, 24)
+ 
+ /* Shared L2 trailer: rewritten MAC/VLAN/PPPoE header for the bound flow. */
++/*
++ * The FOE table is little-endian and __en75_ppe_foe_commit() byte-swaps the
++ * entry one 32-bit word at a time. Each word here that packs two u16s must
++ * therefore list them in the order that yields the correct little-endian
++ * layout after that swap on this big-endian SoC, i.e. the opposite of the
++ * little-endian struct: the field that belongs in the low 16 bits is declared
++ * second. (Single u32 fields like dest_mac_hi are unaffected.)
++ */
+ struct en75_foe_mac_info {
+-	u16 vlan1;
+ 	u16 etype;
++	u16 vlan1;
+ 
+ 	u32 dest_mac_hi;
+ 
+-	u16 vlan2;
+ 	u16 dest_mac_lo;
++	u16 vlan2;
+ 
+ 	u32 src_mac_hi;
+ 
+-	u16 pppoe_id;
+ 	u16 src_mac_lo;
++	u16 pppoe_id;
+ };
+ 
+ _Static_assert(sizeof(struct en75_foe_mac_info) == 20,

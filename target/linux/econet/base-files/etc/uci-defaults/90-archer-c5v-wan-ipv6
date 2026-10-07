@@ -1,0 +1,24 @@
+#!/bin/sh
+# TP-Link Archer C5v: stop netifd from spawning a dynamic IPv6 sub-interface on
+# the PPPoE WAN.
+#
+# config_generate always sets network.wan.ipv6='1' for a pppoe wan, which makes
+# netifd bring up a dynamic "wan_6" interface *in addition to* the static "wan6"
+# dhcpv6 companion it also creates. The two collide: "wan_6" fails its proto
+# setup ("ubus error: Invalid argument") and netifd retries it several times a
+# second, indefinitely -- on this weak 2-core (4-VPE) EN751221 SoC that fork
+# loop burns roughly half the CPU and measurably drops Wi-Fi<->WAN throughput.
+# The static "wan6" already provides IPv6 (global address + /60 prefix
+# delegation), so just disable the dynamic one. See OpenWrt issues #21422 and
+# #20815. (Confirmed and measured on the sibling EX20v / EN7528 board.)
+#
+# Runs once at first boot / factory reset, after config_generate has written the
+# default network config; the committed value then persists across reboots.
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "tplink,archer-c5v" ] || exit 0
+[ "$(uci -q get network.wan.proto)" = "pppoe" ] || exit 0
+
+uci -q set network.wan.ipv6='0'
+uci -q commit network
+
+exit 0

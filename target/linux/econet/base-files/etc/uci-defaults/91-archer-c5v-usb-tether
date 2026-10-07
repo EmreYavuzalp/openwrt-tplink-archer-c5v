@@ -1,0 +1,36 @@
+#!/bin/sh
+# TP-Link Archer C5v: Android USB tethering as a backup WAN (consumer "USB/4G
+# failover" behaviour, pre-configured so the customer needs no router-side setup).
+#
+# Plug an Android phone into the USB port and turn on "USB tethering" on the
+# phone. The phone shows up as the network device usb0 (RNDIS or NCM, both
+# drivers are in the image); the router picks it up via DHCP and routes through
+# it. It carries a higher route metric than the primary PPPoE WAN, so it only
+# takes over when the main line is down -- exactly how an off-the-shelf router's
+# "USB/4G backup" works. The one manual step (enabling tethering on the phone)
+# is unavoidable: Android starts with it off on every plug-in, for security.
+#
+# Runs once at first boot / factory reset, after config_generate has written the
+# default network/firewall config; the committed values persist across reboots.
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "tplink,archer-c5v" ] || exit 0
+
+# Idempotent: skip if already present.
+if ! uci -q get network.usbwan >/dev/null; then
+	uci -q batch <<-EOF
+		set network.usbwan=interface
+		set network.usbwan.proto='dhcp'
+		set network.usbwan.device='usb0'
+		set network.usbwan.metric='20'
+		commit network
+	EOF
+fi
+
+# Add usbwan to the 'wan' firewall zone so LAN traffic is masqueraded out of it.
+zone=$(uci -q show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'\$/\1/p" | head -n1)
+if [ -n "$zone" ] && ! uci -q get "firewall.$zone.network" | grep -qw usbwan; then
+	uci -q add_list "firewall.$zone.network=usbwan"
+	uci -q commit firewall
+fi
+
+exit 0

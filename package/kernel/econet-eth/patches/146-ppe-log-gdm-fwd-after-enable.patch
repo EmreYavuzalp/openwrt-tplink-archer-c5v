@@ -1,0 +1,33 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: log GDM forward config after routing traffic to PPE
+
+Patch 145 logs the FE register state from en75_ppe_start(), but that happens
+before en75_port_enable_ppe_fwd() rewrites the GDM forward config. Log the GDM
+fwd_cfg before and after the PPE fport change so the boot dmesg shows the
+actual value used while traffic is being steered into the PPE.
+
+--- a/econet_port.c	2026-07-01 10:08:58.249854451 +0300
++++ b/econet_port.c	2026-07-01 10:08:58.253854241 +0300
+@@ -141,14 +141,22 @@
+ {
+ 	struct en75_gdm_port *port = netdev_priv(dev);
+ 	struct fwd_cfg fc;
++	u32 old;
+ 
+ 	port->ppe = ppe;
+ 
+ 	guard(spinlock)(&port->reg_lock);
+ 	fc = en75_rreg(&port->regs->fwd_cfg);
++	old = fc.word;
+ 	set_gdm_fwd_cfg_mymac_fport(&fc, ETX_FPORT_PPE);
+ 	set_gdm_fwd_cfg_default_fport(&fc, ETX_FPORT_PPE);
+ 	en75_wreg(fc, &port->regs->fwd_cfg);
++
++	netdev_info(dev, "PPE GDM fwd_cfg: old=%08x new=%08x mymac=%u bcast=%u mcast=%u default=%u\n",
++		    old, fc.word, get_gdm_fwd_cfg_mymac_fport(&fc),
++		    get_gdm_fwd_cfg_bcast_fport(&fc),
++		    get_gdm_fwd_cfg_mcast_fport(&fc),
++		    get_gdm_fwd_cfg_default_fport(&fc));
+ }
+ 
+ static int en75_dev_init(struct net_device *dev)

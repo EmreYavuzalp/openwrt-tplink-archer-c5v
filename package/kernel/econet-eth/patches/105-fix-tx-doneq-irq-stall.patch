@@ -1,0 +1,59 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: fix TX done-queue interrupt stall, cut completion latency
+
+The TX done-queue interrupt only fires on the queue's empty ->
+non-empty transition. Under sustained load the completion poll drains
+a snapshot of the queue while new completions keep arriving, so the
+queue never goes empty, the interrupt never re-arms, and completions
+are only processed when an unrelated interrupt happens to run the
+handler. In practice that is the timer tick: during a TX flood the
+econet IRQ count advances in exact lockstep with the timer IRQ
+(~105/s at HZ=100), TX-done is processed in 10 ms batches, and TX
+throughput is capped at roughly ring_size/jiffy (~11k pps, ~120 Mbit/s
+at 1400 bytes) with the CPU >90% idle.
+
+Two fixes:
+
+1. After napi_complete()/unmask, re-read the done-queue state and
+   re-schedule the NAPI if entries are pending. Under load the poll
+   then self-sustains without depending on the broken re-arm.
+
+2. Program done_queue.wait_time (IRQ coalescing delay, ~20 us units)
+   to 1 instead of the hardware default 0x20. Verified live on a
+   TP-Link Archer C5v (EN751221): this alone took single-flow UDP TX
+   from 92 to 124 Mbit/s.
+
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -527,6 +527,18 @@
+ 		union irq_bit b = en751221_irq_bit(purpose);
+ 
+ 		en75_qdma_set_irqmask(qdma, b, true);
++
++		/* The done-queue interrupt only fires on the empty ->
++		 * non-empty transition. Completions that arrive while we
++		 * are polling leave the queue non-empty, so no further
++		 * interrupt ever comes and they sit unprocessed until an
++		 * unrelated interrupt runs the handler -- in practice the
++		 * timer tick, so TX-done arrives in 10 ms batches and
++		 * throughput is capped at ring_size/jiffy. Re-check after
++		 * unmasking and keep polling if there is still work. */
++		state = en75_rreg(&done_q->regs->state);
++		if (get_qregs_doneq_state_length(&state) > 0)
++			napi_schedule(napi);
+ 	}
+ 
+ 	return done;
+@@ -732,6 +744,12 @@
+ 	set_qregs_doneq_cfg_int_threshold(&cfg, 1);
+ 	en75_wreg(cfg, &qdma->regs->done_queue.config);
+ 
++	/* Interrupt as soon as anything is in the done queue: this wait
++	 * time directly bounds TX completion latency (live test on
++	 * EN751221: 0x20 -> 1 took single-flow UDP TX from 92 to
++	 * 124 Mbit/s). Unit is ~20 us. */
++	en75_wreg(1U, &qdma->regs->done_queue.wait_time);
++
+ 	return 0;
+ }
+ 

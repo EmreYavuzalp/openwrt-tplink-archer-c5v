@@ -1,0 +1,48 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: PPE search-miss FORWARD instead of FORWARD_BUILD
+
+FORWARD_BUILD(3) makes the hardware auto-learn and auto-bind FOE entries for
+every flow it sees without the driver building them. Those entries carry no
+valid L2/L3/VLAN rewrite data (observed: bind=43 with ipv6-6rd/ipv4-dslite
+garbage shortly after boot) and can mis-forward routed traffic.
+
+Switch to FORWARD(2): on a miss the engine punts to CPU with UN_HIT and the
+real hash slot in the QDMA descriptor, where en75_ppe_offload_rx_commit()
+publishes driver-built entries. Expected TB_CFG changes from 0x14fbc to
+0x14fac (SEARCH_MISS bits 5:4 = 2).
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -274,13 +274,13 @@ void en75_ppe_start(struct en75_ppe *ppe)
+ 	      EN75_PPE_TB_CFG_AGE_TCP |
+ 	      EN75_PPE_TB_CFG_AGE_UDP |
+ 	      EN75_PPE_TB_CFG_AGE_TCP_FIN |
+-	      /* FORWARD_BUILD: the engine learns each flow at its real hash
+-	       * slot (reported via crsn HIT_UNBIND/RATE_REACHED) - the only
+-	       * slot it actually searches. The plain-FORWARD miss slot is not
+-	       * on that set. (Auto-bind garbage is the cost; addressed next.)
++	      /* FORWARD: on a search miss the engine punts to CPU (UN_HIT)
++	       * with the real hash slot in the descriptor. Driver-built entries
++	       * are committed there via en75_ppe_offload_rx_commit(). No
++	       * hardware auto-learn (FORWARD_BUILD self-populates garbage).
+ 	       */
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_SEARCH_MISS,
+-			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD_BUILD) |
++			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_KEEPALIVE,
+ 			 EN75_PPE_KEEPALIVE_DISABLE) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_HASH_MODE, 1) |
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -206,9 +206,9 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+ 	switch (get_erx_crsn(&desc.msg.erx)) {
+-	case 0x0d:	/* UN_HIT */
++	case 0x0d:	/* UN_HIT: under FORWARD the hardware reports the real
++			 * hash slot on a miss; publish any staged entry. */
+ 	case 0x0e:	/* HIT_UNBIND */
+-	case 0x0f:	/* HIT_UNBIND_RATE_REACHED: under FORWARD_BUILD these carry
+-			 * the engine's real learned slot; publish the staged entry. */
++	case 0x0f:	/* HIT_UNBIND_RATE_REACHED */
+ 		en75_ppe_offload_rx_commit(en75_eth_ppe(q->qdma->eth), skb, hash);
+ 		break;
+ 	case 0x16: {	/* HIT_BIND_FORCE_CPU: a bound entry was hit. Log once
+ 			 * so the offload path can be confirmed on hardware. */

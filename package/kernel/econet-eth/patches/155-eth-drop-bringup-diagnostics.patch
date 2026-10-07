@@ -1,0 +1,213 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: drop the offload bring-up diagnostics from the hot paths
+
+The PPE offload is done and verified; remove the instrumentation that
+was still riding along on every packet:
+
+- the RX crsn histogram (per-packet counter + a printk every 5s in the
+  NAPI loop),
+- the rxc bind-hint counters and their 5s printk in
+  en75_ppe_offload_rx_commit(), plus the per-bind pr_info,
+- the BINDDBG pre/post FOE word dumps on every bind,
+- the ACTDBG action-list dump on rejected rules.
+
+Functional behaviour is unchanged; debugfs (foe, foe_slot, test_bind)
+remains the inspection interface.
+--- a/econet_qdma.c	2026-07-03 13:47:29.087946793 +0300
++++ b/econet_qdma.c	2026-07-03 13:48:06.937940990 +0300
+@@ -203,25 +203,6 @@
+ 	skb_set_hash(skb, jhash_1word(hash, 0),
+ 		     PKT_HASH_TYPE_L4);
+ 
+-	{
+-		/* DIAGNOSTIC: dump the distribution of PPE CPU-reason codes seen
+-		 * on RX every 5s, so we can tell a wrong-slot miss (only 0x0d)
+-		 * from a found-but-unbound hit (0x0e) and spot any real bind-hit
+-		 * reason (0x16 or otherwise) the offload path is missing. */
+-		u8 __crsn = get_erx_crsn(&desc.msg.erx);
+-		static u32 __crsn_hist[32];
+-		static unsigned long __crsn_last;
+-
+-		__crsn_hist[__crsn & 31]++;
+-		if (!__crsn_last || time_after(jiffies, __crsn_last + 5 * HZ)) {
+-			__crsn_last = jiffies;
+-			pr_info("econet-eth: crsn hist 00=%u 0c=%u 0d=%u 0e=%u 0f=%u 10=%u 16=%u 17=%u 18=%u 19=%u 1a=%u\n",
+-				__crsn_hist[0x00], __crsn_hist[0x0c], __crsn_hist[0x0d],
+-				__crsn_hist[0x0e], __crsn_hist[0x0f], __crsn_hist[0x10],
+-				__crsn_hist[0x16], __crsn_hist[0x17], __crsn_hist[0x18],
+-				__crsn_hist[0x19], __crsn_hist[0x1a]);
+-		}
+-	}
+ 
+ 	switch (get_erx_crsn(&desc.msg.erx)) {
+ 	case 0x0d:	/* UN_HIT: search miss. Under SEARCH_MISS=FORWARD the engine
+--- a/econet_ppe_offload.c	2026-07-03 13:47:29.091946576 +0300
++++ b/econet_ppe_offload.c	2026-07-03 13:51:07.356394678 +0300
+@@ -399,27 +399,8 @@
+ 		return -EOPNOTSUPP;
+ 
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+-	    !is_valid_ether_addr(data.eth.h_dest)) {
+-		static atomic_t rejdumps = ATOMIC_INIT(0);
+-
+-		if (atomic_inc_return(&rejdumps) <= 24) {
+-			pr_info("econet-eth: ACTDBG reject dst=%pM src=%pM vlans=%d pppoe=%d\n",
+-				data.eth.h_dest, data.eth.h_source,
+-				data.vlan.num, data.pppoe.num);
+-			flow_action_for_each(i, act, &rule->action) {
+-				if (act->id == FLOW_ACTION_MANGLE)
+-					pr_info("econet-eth: ACTDBG [%d] MANGLE htype=%d off=%u mask=%08x val=%08x\n",
+-						i, act->mangle.htype,
+-						act->mangle.offset,
+-						act->mangle.mask,
+-						act->mangle.val);
+-				else
+-					pr_info("econet-eth: ACTDBG [%d] id=%d\n",
+-						i, act->id);
+-			}
+-		}
++	    !is_valid_ether_addr(data.eth.h_dest))
+ 		return -EINVAL;
+-	}
+ 
+ 	/* Milestone 2b-3a forces the egress to the CPU: the entry is fully
+ 	 * built (incl. the L2 rewrite from the eth mangle actions) but the
+@@ -608,48 +589,6 @@
+ 	return 0;
+ }
+ 
+-/* Min jiffies between engine-slot scans for one still-unbound flow. */
+-#define EN75_PPE_SCAN_BACKOFF (HZ / 10)
+-
+-static void en75_ppe_dump_bind_words(struct en75_ppe *ppe, u32 slot,
+-				     const struct en75_foe_entry *built,
+-				     const char *tag)
+-{
+-	static u32 dumps;
+-	const u32 *live = (const u32 *)&ppe->foe[slot];
+-	const u32 *b = (const u32 *)built;
+-	u32 l0, l1, l2, l3, l4, l5, l11, l12, l13, l14, l15, l16, l17, l18, l19;
+-	u32 bi0, bi1, bi2, bi3, bi4, bi5, bi11, bi12, bi13, bi14, bi15, bi16, bi17, bi18, bi19;
+-
+-	if (dumps++ >= 16)
+-		return;
+-
+-	l0 = le32_to_cpu(READ_ONCE(live[0]));
+-	l1 = le32_to_cpu(READ_ONCE(live[1]));
+-	l2 = le32_to_cpu(READ_ONCE(live[2]));
+-	l3 = le32_to_cpu(READ_ONCE(live[3]));
+-	l4 = le32_to_cpu(READ_ONCE(live[4]));
+-	l5 = le32_to_cpu(READ_ONCE(live[5]));
+-	l11 = le32_to_cpu(READ_ONCE(live[11]));
+-	l12 = le32_to_cpu(READ_ONCE(live[12]));
+-	l13 = le32_to_cpu(READ_ONCE(live[13]));
+-	l14 = le32_to_cpu(READ_ONCE(live[14]));
+-	l15 = le32_to_cpu(READ_ONCE(live[15]));
+-	l16 = le32_to_cpu(READ_ONCE(live[16]));
+-	l17 = le32_to_cpu(READ_ONCE(live[17]));
+-	l18 = le32_to_cpu(READ_ONCE(live[18]));
+-	l19 = le32_to_cpu(READ_ONCE(live[19]));
+-
+-	bi0 = b[0]; bi1 = b[1]; bi2 = b[2]; bi3 = b[3]; bi4 = b[4]; bi5 = b[5];
+-	bi11 = b[11]; bi12 = b[12]; bi13 = b[13]; bi14 = b[14]; bi15 = b[15];
+-	bi16 = b[16]; bi17 = b[17]; bi18 = b[18]; bi19 = b[19];
+-
+-	pr_info("econet-eth: BINDDBG %s slot=%u live0-5=%08x %08x %08x %08x %08x %08x live11-19=%08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-		tag, slot, l0, l1, l2, l3, l4, l5, l11, l12, l13, l14, l15, l16, l17, l18, l19);
+-	pr_info("econet-eth: BINDDBG %s slot=%u built0-5=%08x %08x %08x %08x %08x %08x built11-19=%08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-		tag, slot, bi0, bi1, bi2, bi3, bi4, bi5, bi11, bi12, bi13, bi14, bi15, bi16, bi17, bi18, bi19);
+-}
+-
+ /*
+  * Find the slot where the engine auto-learned (FORWARD_BUILD) an UNBIND entry
+  * for this flow. The descriptor-reported hash is not the engine's real search
+@@ -659,6 +598,9 @@
+  * @want is host byte order; the live table is little-endian.
+  */
+ /* True if the UNBIND entry the engine learned at slot @i matches @want. */
++/* Min jiffies between engine-slot scans for one still-unbound flow. */
++#define EN75_PPE_SCAN_BACKOFF (HZ / 10)
++
+ static bool en75_ppe_slot_matches(struct en75_ppe *ppe, u32 i,
+ 				  const struct en75_foe_entry *want)
+ {
+@@ -791,36 +733,22 @@
+ 	struct en75_flow_entry *entry;
+ 	struct en75_flow_tuple key;
+ 	unsigned long flags;
+-	/* DIAGNOSTIC: where do the RX bind hints go? Printed every 5s so a
+-	 * many-flow test shows whether commits fail at tuple-parse (PPPoE/encap),
+-	 * lookup (flow not staged), backoff, or slot resolution. */
+-	static u32 d_call, d_noparse, d_nolk, d_notpend, d_backoff, d_noslot, d_bound;
+-	static unsigned long d_last;
+ 
+ 	if (IS_ERR_OR_NULL(ppe) || !ppe->tuple_table_ready)
+ 		return;
+ 	if (hw_slot >= EN75_PPE_ENTRIES)
+ 		return;
+ 
+-	d_call++;
+-
+ 	en75_flow_tuple_from_skb(&key, skb);
+-	if (!key.l4proto) {
+-		d_noparse++;
+-		goto out_log;
+-	}
++	if (!key.l4proto)
++		return;
+ 
+ 	rcu_read_lock();
+ 	entry = rhashtable_lookup(&ppe->tuple_table, &key,
+ 				  en75_tuple_ht_params);
+-	if (!entry) {
+-		d_nolk++;
+-	} else if (READ_ONCE(entry->state) != EN75_FLOW_PENDING) {
+-		d_notpend++;
+-	} else if (time_before(jiffies,
+-			       READ_ONCE(entry->last_scan) + EN75_PPE_SCAN_BACKOFF)) {
+-		d_backoff++;
+-	} else {
++	if (entry && READ_ONCE(entry->state) == EN75_FLOW_PENDING &&
++	    !time_before(jiffies,
++			 READ_ONCE(entry->last_scan) + EN75_PPE_SCAN_BACKOFF)) {
+ 		int slot;
+ 
+ 		WRITE_ONCE(entry->last_scan, jiffies);
+@@ -830,9 +758,7 @@
+ 		 * re-checks the state under the lock, so a racy read only risks a
+ 		 * retry. */
+ 		slot = en75_ppe_find_engine_slot(ppe, &entry->foe, hw_slot);
+-		if (slot < 0) {
+-			d_noslot++;
+-		} else {
++		if (slot >= 0) {
+ 			spin_lock_irqsave(&ppe->foe_lock, flags);
+ 			if (entry->state == EN75_FLOW_PENDING) {
+ 				struct en75_foe_entry e = entry->foe;
+@@ -840,26 +766,14 @@
+ 				e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
+ 				e.ib1 |= FIELD_PREP(EN75_FOE_IB1_STATE, EN75_FOE_STATE_BIND);
+ 				e.ib1 |= en75_ppe_timestamp(ppe);
+-				en75_ppe_dump_bind_words(ppe, slot, &e, "pre");
+ 				__en75_ppe_foe_commit(ppe, slot, &e);
+-				en75_ppe_dump_bind_words(ppe, slot, &e, "post");
+ 				entry->hash = slot;
+ 				entry->state = EN75_FLOW_COMMITTED;
+-				d_bound++;
+-				pr_info_ratelimited("econet-eth: PPE bound flow at engine slot %u (hw_slot was %u)\n",
+-						    slot, hw_slot);
+ 			}
+ 			spin_unlock_irqrestore(&ppe->foe_lock, flags);
+ 		}
+ 	}
+ 	rcu_read_unlock();
+-
+-out_log:
+-	if (!d_last || time_after(jiffies, d_last + 5 * HZ)) {
+-		d_last = jiffies;
+-		pr_info("econet-eth: rxc call=%u noparse=%u nolk=%u notpend=%u backoff=%u noslot=%u bound=%u\n",
+-			d_call, d_noparse, d_nolk, d_notpend, d_backoff, d_noslot, d_bound);
+-	}
+ }
+ 
+ static DEFINE_MUTEX(en75_flow_offload_mutex);

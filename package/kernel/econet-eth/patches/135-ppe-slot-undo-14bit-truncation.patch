@@ -1,0 +1,50 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: undo 14-bit truncation of the engine slot (full O(1))
+
+134 computed real_slot = hw_slot*2/5 straight from the descriptor, but the
+ppe_entry field is only 14 bits (GENMASK(13,0), max 16383) while real_slot*5/2
+reaches 40957 for the upper half of the 16384-entry table. The field is thus
+truncated mod 16384, so the bare *2/5 guess was correct only for the low ~40%
+of slots; every flow that hashed higher missed the guess and fell through to
+the full-table scan, which under a many-flow speed test ran in softirq for the
+majority of flows and pinned the CPU at ~75% sirq again.
+
+real_slot is always even (hash<<1), so the field is 5*hash - m*16384 with the
+wrap count m in {0,1,2}. Because -16384 == 1 (mod 5), m == field mod 5, so the
+wrap is recovered with no search: real_slot = (hw_slot + (hw_slot%5)*16384)*2/5.
+The whole table is O(1) now; the scan stays only as a safety net.
+
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -583,10 +583,19 @@
+ /*
+  * The slot the engine actually searches. The RX descriptor's ppe_entry field
+  * reports the matching FOE entry scaled by 80/32 = 2.5 (the engine counts in
+- * 32-byte units while an entry is 80 bytes), so the real index is hw_slot*2/5.
++ * 32-byte units while an entry is 80 bytes), so the field holds real_slot*5/2.
+  * Verified on hardware: hw_slot 40->16, 6840->2736, 4440->1776, 4510->1804.
+- * This is O(1); the full table scan is only a fallback for the rare case the
+- * scaled value does not divide cleanly or the entry is not where expected.
++ *
++ * But ppe_entry is only 14 bits (max 16383) while real_slot*5/2 reaches 40957
++ * for the upper slots, so the field is TRUNCATED mod 16384. real_slot is always
++ * even (hash<<1), so real_slot*5/2 = 5*hash and the truncation drops whole
++ * multiples of 16384: field = 5*hash - m*16384 with the wrap count m in {0,1,2}
++ * (5*hash <= 40955 < 3*16384). m is recoverable directly: since -16384 == 1 mod
++ * 5, field mod 5 == (5*hash - m*16384) mod 5 == m. Undo the wrap before scaling:
++ *   real_slot = (hw_slot + (hw_slot % 5) * 16384) * 2 / 5
++ * This makes the upper ~60% of the table O(1) too (previously they missed the
++ * scaled guess and fell through to the full scan, pinning the CPU in softirq).
++ * The scan stays only as a safety net for a genuinely unexpected descriptor.
+  */
+ static int en75_ppe_find_engine_slot(struct en75_ppe *ppe,
+ 				     const struct en75_foe_entry *want,
+@@ -594,7 +603,7 @@
+ {
+ 	u32 i;
+ 
+-	i = (hw_slot * 2) / 5;
++	i = (hw_slot + (hw_slot % 5) * EN75_PPE_ENTRIES) * 2 / 5;
+ 	if (en75_ppe_slot_matches(ppe, i, want))
+ 		return i;
+ 

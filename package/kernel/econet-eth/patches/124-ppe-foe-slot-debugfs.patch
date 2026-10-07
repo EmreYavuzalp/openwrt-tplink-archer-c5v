@@ -1,0 +1,100 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: debugfs foe_slot for direct FOE slot lookup
+
+The foe dump lists at most 64 non-invalid entries in index order, so
+grep on high slots (e.g. 10371) always fails even while bind>100. Add
+foe_slot: write a slot number, then cat to dump orig/new/ib2 for that
+index regardless of the truncated list.
+
+diff -ruN b123/econet_ppe.c b124/econet_ppe.c
+--- a/econet_ppe.c	2026-06-29 00:15:45.686568772 +0300
++++ b/econet_ppe.c	2026-06-29 00:16:02.869936954 +0300
+@@ -168,6 +168,79 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(en75_ppe_foe);
+ 
++/* Slot selected by "echo N > foe_slot"; read back with cat foe_slot. */
++static u32 en75_ppe_foe_debug_slot;
++
++static void en75_ppe_foe_dump_slot(struct seq_file *m, struct en75_ppe *ppe, u32 i)
++{
++	u32 ib1 = READ_ONCE(ppe->foe[i].ib1);
++	u32 state = FIELD_GET(EN75_FOE_IB1_STATE, ib1);
++	u32 type = FIELD_GET(EN75_FOE_IB1_PACKET_TYPE, ib1);
++	struct en75_foe_ipv4 *e;
++
++	if (i >= EN75_PPE_ENTRIES) {
++		seq_printf(m, "slot %u: out of range (max %u)\n",
++			   i, EN75_PPE_ENTRIES - 1);
++		return;
++	}
++
++	seq_printf(m, "[%5u] %-6s %-13s ib1=%08x\n", i,
++		   foe_state_name(state), foe_pkt_type_name(type), ib1);
++	if (state == EN75_FOE_STATE_INVALID) {
++		seq_puts(m, "(entry invalid)\n");
++		return;
++	}
++
++	if (type != EN75_PPE_PKT_TYPE_IPV4_HNAPT &&
++	    type != EN75_PPE_PKT_TYPE_IPV4_ROUTE)
++		return;
++
++	e = &ppe->foe[i].ipv4;
++	seq_printf(m, " orig sip=%08x dip=%08x ports=%08x\n",
++		   e->orig.src_ip, e->orig.dest_ip, e->orig.ports);
++	if (type == EN75_PPE_PKT_TYPE_IPV4_HNAPT)
++		seq_printf(m, " new  sip=%08x dip=%08x ports=%08x ib2=%08x\n",
++			   e->new.src_ip, e->new.dest_ip, e->new.ports, e->ib2);
++}
++
++static int en75_ppe_foe_slot_show(struct seq_file *m, void *v)
++{
++	en75_ppe_foe_dump_slot(m, m->private, en75_ppe_foe_debug_slot);
++	return 0;
++}
++
++static ssize_t en75_ppe_foe_slot_write(struct file *file,
++				       const char __user *ubuf,
++				       size_t len, loff_t *ppos)
++{
++	char buf[16] = {};
++	unsigned long val;
++
++	if (len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++
++	if (kstrtoul(buf, 0, &val) || val >= EN75_PPE_ENTRIES)
++		return -EINVAL;
++
++	en75_ppe_foe_debug_slot = val;
++	return len;
++}
++
++static int en75_ppe_foe_slot_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, en75_ppe_foe_slot_show, inode->i_private);
++}
++
++static const struct file_operations en75_ppe_foe_slot_fops = {
++	.open		= en75_ppe_foe_slot_open,
++	.read		= seq_read,
++	.write		= en75_ppe_foe_slot_write,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
+ /*
+  * Debug facility: bind one synthetic, STATIC IPv4 HNAPT entry whose egress
+  * PSE port is the CPU. The tuple uses RFC5737 TEST-NET addresses so it can
+@@ -252,6 +325,8 @@
+ 			    &en75_ppe_foe_fops);
+ 	debugfs_create_file("test_bind", 0200, ppe->debugfs, ppe,
+ 			    &en75_ppe_test_bind_fops);
++	debugfs_create_file("foe_slot", 0644, ppe->debugfs, ppe,
++			    &en75_ppe_foe_slot_fops);
+ 
+ 	if (en75_ppe_offload_init(ppe))
+ 		dev_warn(dev, "flow offload table init failed\n");

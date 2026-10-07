@@ -1,0 +1,106 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: use the vendor FOE cache enable/clear protocol
+
+The FOE cache registers on EN751221 (chip id 0xbfb00064 = 0x0007xxxx) do not
+follow the mtk CACHE_CTL bitmap the driver assumed:
+
+  - 0x320 (0xbfb50f20) is a COMMAND register: write 0x4100 (clear-all request,
+    bit14 op + bit8 REQ) and the hardware clears bit8 when the request is
+    done (vendor ppeCacheCmd_request/is_request_done poll exactly this).
+  - the cache ENABLE lives at 0x334 (0xbfb50f34) bit0; vendor PpeSetCacheEbl
+    for chip families 0x0007/0x0008 enables by writing the magic 0x33 there
+    (enable + mode bits) and disables by clearing bit0.
+  - vendor PpeCleanCache751221/ppeCacheClearAll clear sequence: gate the
+    cache off (0x334 bit0=0), issue 0x4100 to 0x320, poll bit8, gate back on.
+
+Our init wrote CACHE_CTL_EN=1 into the command register (a junk command) and
+never touched 0x334 - live readback: 0x334=0x0 (cache disabled/unconfigured),
+0x320=0x1. The clear helper toggled bit9 of the command register, also a
+no-op. Net effect: the lookup kept serving the stale learned UNBIND state -
+bound flows punted forever with crsn 0x0f while debugfs showed the BIND entry
+present in DRAM, and the few crsn 0x10 (HIT_BIND_TCP_FIN) hits show the
+bind/hit path itself works when the lookup does see fresh state.
+
+Program the cache exactly like the vendor module: enable with 0x33 at start,
+clear-all with the gated 0x4100 command sequence, gate off on stop.
+
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -123,9 +123,17 @@
+
+ #define EN75_PPE_DEFAULT_CPU_PORT	0x248
+
+-#define EN75_PPE_CACHE_CTL		0x320
+-#define EN75_PPE_CACHE_CTL_EN			BIT(0)
+-#define EN75_PPE_CACHE_CTL_CLEAR			BIT(9)
++/* 0x320 is a cache COMMAND register on EN751221 (vendor ppeCacheCmd_request):
++ * write an op with the REQ bit set, hardware clears REQ when done. 0x334 is
++ * the cache enable/config register; vendor PpeSetCacheEbl writes magic 0x33
++ * (enable + mode bits) for chip families 0x0007/0x0008.
++ */
++#define EN75_PPE_CACHE_CTL		0x320
++#define EN75_PPE_CACHE_CTL_REQ			BIT(8)
++#define EN75_PPE_CACHE_CTL_CLEAR_ALL		0x4100
++#define EN75_PPE_CACHE_EN		0x334
++#define EN75_PPE_CACHE_EN_EBL			BIT(0)
++#define EN75_PPE_CACHE_EN_MAGIC			0x33
+
+ /* Frame-engine free-running timestamp (FE+0x10), drives FOE aging. */
+ #define EN75_FE_FOE_TS			0x10
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -14,6 +14,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
++#include <linux/delay.h>
+ #include <linux/fs.h>
+ #include <linux/uaccess.h>
+ #include <linux/if_ether.h>
+@@ -51,10 +52,25 @@
+
+ static void en75_ppe_cache_clear(struct en75_ppe *ppe)
+ {
+-	u32 v = ppe_r32(ppe, EN75_PPE_CACHE_CTL);
++	int i;
+
+-	ppe_w32(ppe, EN75_PPE_CACHE_CTL, v | EN75_PPE_CACHE_CTL_CLEAR);
+-	ppe_w32(ppe, EN75_PPE_CACHE_CTL, v & ~EN75_PPE_CACHE_CTL_CLEAR);
++	/* Vendor PpeCleanCache751221 sequence: gate the cache off, issue the
++	 * clear-all command, wait for the REQ bit to self-clear, gate the
++	 * cache back on.
++	 */
++	ppe_w32(ppe, EN75_PPE_CACHE_EN,
++		ppe_r32(ppe, EN75_PPE_CACHE_EN) & ~EN75_PPE_CACHE_EN_EBL);
++	ppe_w32(ppe, EN75_PPE_CACHE_CTL, EN75_PPE_CACHE_CTL_CLEAR_ALL);
++	for (i = 0; i < 1000; i++) {
++		if (!(ppe_r32(ppe, EN75_PPE_CACHE_CTL) &
++		      EN75_PPE_CACHE_CTL_REQ))
++			break;
++		udelay(1);
++	}
++	if (i == 1000)
++		pr_warn_ratelimited("econet-eth: PPE cache clear timed out\n");
++	ppe_w32(ppe, EN75_PPE_CACHE_EN,
++		ppe_r32(ppe, EN75_PPE_CACHE_EN) | EN75_PPE_CACHE_EN_EBL);
+ }
+
+ void __en75_ppe_foe_commit(struct en75_ppe *ppe, u32 hash,
+@@ -463,6 +478,6 @@
+ 	/* Enable the FOE cache; the table is freshly zeroed so nothing is
+ 	 * stale to flush.
+ 	 */
+-	ppe_w32(ppe, EN75_PPE_CACHE_CTL, EN75_PPE_CACHE_CTL_EN);
++	ppe_w32(ppe, EN75_PPE_CACHE_EN, EN75_PPE_CACHE_EN_MAGIC);
+
+ 	val = EN75_PPE_FLOW_CFG_IP6_3T_ROUTE |
+@@ -539,7 +556,8 @@
+ 	debugfs_remove_recursive(ppe->debugfs);
+ 	ppe->debugfs = NULL;
+
+-	ppe_w32(ppe, EN75_PPE_CACHE_CTL, 0);
++	ppe_w32(ppe, EN75_PPE_CACHE_EN,
++		ppe_r32(ppe, EN75_PPE_CACHE_EN) & ~EN75_PPE_CACHE_EN_EBL);
+ 	ppe_w32(ppe, EN75_PPE_GLO_CFG, 0);
+ 	ppe_wait_busy(ppe);
+ }

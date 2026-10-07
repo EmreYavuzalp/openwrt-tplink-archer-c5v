@@ -1,0 +1,44 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: commit full FOE entry on RX miss (FORWARD mode)
+
+With SEARCH_MISS=FORWARD the hardware does not auto-learn tuple bodies into
+the FOE table on a miss. The RX commit path was still using the vendor
+FoeBindEntry "REBIND" trick (flip ib1 on the engine's learned body), which
+only works under FORWARD_BUILD. The result was BIND-state entries with empty
+tuple data: REBIND oldstate=0 followed by endless re-miss on the same slots.
+
+Publish the driver-built entry->foe at the hardware-reported slot instead.
+--- a/econet_ppe_offload.c
++++ b/econet_ppe_offload.c
+@@ -545,28 +545,20 @@ void en75_ppe_offload_rx_commit(struct en75_ppe *ppe, struct sk_buff *skb,
+ 		if (entry->state == EN75_FLOW_PENDING) {
+-			/* Vendor FoeBindEntry style: rebind the engine's OWN learned
+-			 * entry by flipping only ib1 (fresh timestamp + STATE=BIND),
+-			 * leaving the body the engine wrote. Overwriting the body made
+-			 * the engine re-learn it as UNBIND.
+-			 */
+-			static atomic_t bdbg = ATOMIC_INIT(12);
+-			struct en75_foe_entry e = ppe->foe[hw_slot];
+-			u32 os = FIELD_GET(EN75_FOE_IB1_STATE, e.ib1);
++			struct en75_foe_entry e = entry->foe;
+ 
+ 			e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
+ 			e.ib1 |= FIELD_PREP(EN75_FOE_IB1_STATE, EN75_FOE_STATE_BIND);
+ 			e.ib1 |= en75_ppe_timestamp(ppe);
+ 			__en75_ppe_foe_commit(ppe, hw_slot, &e);
+ 			entry->hash = hw_slot;
+ 			entry->state = EN75_FLOW_COMMITTED;
+-			if (atomic_dec_if_positive(&bdbg) >= 0)
+-				pr_info("econet-eth: REBIND slot=%u oldstate=%u ib1=%08x->%08x\n",
+-					hw_slot, os, ppe->foe[hw_slot].ib1, e.ib1);
++			pr_info_once("econet-eth: PPE flow committed at slot %u (FORWARD miss)\n",
++				     hw_slot);
+ 		} else if (entry->state == EN75_FLOW_COMMITTED) {
+ 			static atomic_t dbg = ATOMIC_INIT(16);
+ 
+ 			if (atomic_dec_if_positive(&dbg) >= 0)
+ 				pr_info("econet-eth: re-miss slot=%u state=%u ib1=%08x\n",
+ 					entry->hash,
+ 					(u32)FIELD_GET(EN75_FOE_IB1_STATE, ppe->foe[entry->hash].ib1),
+ 					ppe->foe[entry->hash].ib1);
+ 		}

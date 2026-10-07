@@ -1,0 +1,73 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: DIAGNOSTIC - crsn histogram + sw-hash vs hw-slot
+
+Driver-built BIND entries are now byte-correct (state=BIND, right IP/ports) and
+sit at the descriptor-reported slot, yet the engine never hits them. Two cheap
+probes to localise it in one boot:
+
+ 1. RX crsn histogram (every 5s): shows the distribution of PPE CPU-reason
+    codes. Only 0x0d (UN_HIT) means the engine searched and found nothing at
+    the slot -> the descriptor ppe_entry is not the real search slot. 0x0e
+    (HIT_UNBIND) means it found our entry but not as BIND. Any 0x16/other
+    "bind hit" code appearing means binding works and the issue is egress.
+
+ 2. On the first commits, log our own en75_foe_entry_hash() next to the
+    hardware-reported hw_slot. HASH-DIFF means the two disagree, i.e. the
+    descriptor field is not the FOE index and we should write at the SW hash.
+
+Pure diagnostics; no behaviour change. Remove once the cause is known.
+
+diff -ruN b127/econet_ppe_offload.c b128/econet_ppe_offload.c
+--- a/econet_ppe_offload.c	2026-06-29 01:32:11.445606960 +0300
++++ b/econet_ppe_offload.c	2026-06-29 01:33:41.007895423 +0300
+@@ -544,8 +544,20 @@
+ 		spin_lock_irqsave(&ppe->foe_lock, flags);
+ 		if (entry->state == EN75_FLOW_PENDING) {
+ 			static atomic_t cdbg = ATOMIC_INIT(8);
++			static atomic_t hdbg = ATOMIC_INIT(12);
+ 			struct en75_foe_entry e = entry->foe;
+ 
++			/* DIAGNOSTIC: does our SW hash match the slot the hardware
++			 * reported? If not, the descriptor "ppe_entry" is not the
++			 * FOE search slot and we commit to the wrong place. */
++			if (atomic_dec_if_positive(&hdbg) >= 0) {
++				u32 sw = en75_foe_entry_hash(&entry->foe);
++
++				pr_info("econet-eth: commit hw_slot=%u sw_hash=%u%s\n",
++					hw_slot, sw,
++					sw == hw_slot ? "" : " HASH-DIFF");
++			}
++
+ 			e.ib1 &= ~(EN75_FOE_IB1_STATE | EN75_FOE_IB1_BIND_TIMESTAMP);
+ 			e.ib1 |= FIELD_PREP(EN75_FOE_IB1_STATE, EN75_FOE_STATE_BIND);
+ 			e.ib1 |= en75_ppe_timestamp(ppe);
+diff -ruN b127/econet_qdma.c b128/econet_qdma.c
+--- a/econet_qdma.c	2026-06-29 01:32:11.437607480 +0300
++++ b/econet_qdma.c	2026-06-29 01:33:17.069402415 +0300
+@@ -203,6 +203,26 @@
+ 	skb_set_hash(skb, jhash_1word(hash, 0),
+ 		     PKT_HASH_TYPE_L4);
+ 
++	{
++		/* DIAGNOSTIC: dump the distribution of PPE CPU-reason codes seen
++		 * on RX every 5s, so we can tell a wrong-slot miss (only 0x0d)
++		 * from a found-but-unbound hit (0x0e) and spot any real bind-hit
++		 * reason (0x16 or otherwise) the offload path is missing. */
++		u8 __crsn = get_erx_crsn(&desc.msg.erx);
++		static u32 __crsn_hist[32];
++		static unsigned long __crsn_last;
++
++		__crsn_hist[__crsn & 31]++;
++		if (!__crsn_last || time_after(jiffies, __crsn_last + 5 * HZ)) {
++			__crsn_last = jiffies;
++			pr_info("econet-eth: crsn hist 00=%u 0c=%u 0d=%u 0e=%u 0f=%u 10=%u 16=%u 17=%u 18=%u 19=%u 1a=%u\n",
++				__crsn_hist[0x00], __crsn_hist[0x0c], __crsn_hist[0x0d],
++				__crsn_hist[0x0e], __crsn_hist[0x0f], __crsn_hist[0x10],
++				__crsn_hist[0x16], __crsn_hist[0x17], __crsn_hist[0x18],
++				__crsn_hist[0x19], __crsn_hist[0x1a]);
++		}
++	}
++
+ 	switch (get_erx_crsn(&desc.msg.erx)) {
+ 	case 0x0d:	/* UN_HIT: under FORWARD the hardware reports the real
+ 			 * hash slot on a miss; publish any staged entry. */

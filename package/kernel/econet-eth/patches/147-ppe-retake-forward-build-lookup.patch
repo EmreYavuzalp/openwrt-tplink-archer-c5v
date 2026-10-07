@@ -1,0 +1,26 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: retest FORWARD_BUILD now that hash and L2 are fixed
+
+With SEARCH_MISS=FORWARD the C5v now clearly routes traffic into the PPE
+(GDM fwd_cfg mymac/default = PPE), and the driver commits valid BIND entries,
+but the RX reason histogram stays at UN_HIT (0x0d) forever: no 0x0e/0x0f and
+no 0x16 even after bound entries exist. That suggests EN751221 may only run
+the full FOE lookup/learn path when SEARCH_MISS is FORWARD_BUILD; plain
+FORWARD may punt misses without entering the bind-hit path on this PPE.
+
+Earlier FORWARD_BUILD tests were polluted by wrong hash/slot selection and
+broken BE L2 rewrite. Re-test it after those fixes. If this brings back
+0x0e/0x0f or 0x16, the remaining work is to bind/replace the engine-learned
+entry in place instead of using plain FORWARD.
+
+--- a/econet_ppe.c	2026-07-01 11:27:46.205500291 +0300
++++ b/econet_ppe.c	2026-07-01 11:27:46.209500072 +0300
+@@ -429,7 +429,7 @@
+ 	       * BIND sticks and the engine hits it on the next packet.
+ 	       */
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_SEARCH_MISS,
+-			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD) |
++			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD_BUILD) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_KEEPALIVE,
+ 			 EN75_PPE_KEEPALIVE_DISABLE) |
+ 	      FIELD_PREP(EN75_PPE_TB_CFG_HASH_MODE, 1) |

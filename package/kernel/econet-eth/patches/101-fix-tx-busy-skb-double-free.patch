@@ -1,0 +1,48 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: don't free the skb when returning NETDEV_TX_BUSY
+
+When the TX ring is full en75_qdma_xmit() returns -EBUSY. The xmit path
+treated that like a fatal error: it freed the skb with dev_kfree_skb_any()
+and then returned NETDEV_TX_BUSY. NETDEV_TX_BUSY tells the qdisc the skb
+was NOT consumed and must be requeued, so the now-freed skb is reused by
+the stack -> use-after-free / double-free. Under TX load this shows up as
+crashes in __qdisc_run (NULL deref) or skb refcount underflow in the RX
+completion path.
+
+Handle the queue-full case separately: undo the BQL accounting, stop the
+queue and return NETDEV_TX_BUSY without freeing the skb. Keep freeing only
+on genuine errors (linearize / DMA mapping failure), which return
+NETDEV_TX_OK (drop).
+
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -209,6 +209,17 @@
+ 
+ 	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0);
+ 
++	if (ret == -EBUSY) {
++		/* The TX ring is full. Undo the BQL accounting and ask the
++		 * qdisc to requeue this skb later. We must NOT free it here:
++		 * NETDEV_TX_BUSY means we did not take ownership of the skb,
++		 * so freeing it causes a use-after-free once the qdisc retries
++		 * (seen as crashes in __qdisc_run / skb refcount underflow). */
++		netdev_tx_completed_queue(txq, 1, len);
++		netif_tx_stop_queue(txq);
++		return NETDEV_TX_BUSY;
++	}
++
+ 	if (ret < 0) {
+ 		netdev_tx_completed_queue(txq, 1, len);
+ 		goto error;
+@@ -223,11 +234,6 @@
+ 	dev_kfree_skb_any(skb);
+ 	dev->stats.tx_dropped++;
+ 
+-	if (ret == -EBUSY) {
+-		netif_tx_stop_queue(txq);
+-		return NETDEV_TX_BUSY;
+-	}
+-
+ 	return NETDEV_TX_OK;
+ }
+ 
