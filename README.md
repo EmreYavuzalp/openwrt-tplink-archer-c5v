@@ -19,6 +19,8 @@ hazır/test edilmiş bir ürün için ürünümüze buradan ulaşabilir:**
 
 * Hepsiburada: https://www.hepsiburada.com/openwrt-yuklu-tp-link-archer-c5v-ac1200-router-p-HBCV0000FGW44B?magaza=ARI%20B%C4%B0L%C4%B0%C5%9E%C4%B0M%20%C4%B0LET%C4%B0%C5%9E%C4%B0M%20VE%20DANI%C5%9EMANLIK
 
+Hepsiburada'dan veya doğrudan ofisimizden faturalı ve garantili olarak da satın alabilirsiniz.
+
 Kurumsal ve toplu alımlar için: emreyavuzalp2@gmail.com
 
 ### WAN Ayarı
@@ -102,6 +104,8 @@ Arı Bilişim İletişim ve Danışmanlık is not responsible for any legal issu
 Users who prefer a ready-to-use, tested device can buy it from Hepsiburada:
 
 * Hepsiburada: https://www.hepsiburada.com/openwrt-yuklu-tp-link-archer-c5v-ac1200-router-p-HBCV0000FGW44B?magaza=ARI%20B%C4%B0L%C4%B0%C5%9E%C4%B0M%20%C4%B0LET%C4%B0%C5%9E%C4%B0M%20VE%20DANI%C5%9EMANLIK
+
+You can also buy directly from our office, invoiced and under warranty.
 
 For corporate and bulk orders: emreyavuzalp2@gmail.com
 
