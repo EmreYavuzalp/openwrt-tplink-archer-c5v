@@ -231,3 +231,38 @@ developed by us; as of this writing they are not in the upstream driver.
   (`eth0.2`).
 * **NAND flash and general stability fixes:** Fixes for instabilities
   observed over long-term use.
+
+
+TP-Link Archer C5v — OpenWrt Personalizado
+
+Este repositorio contiene el código fuente base adaptado para el router TP-Link Archer C5v. Con este firmware obtienes mayor estabilidad, alto rendimiento y control total sobre tu red.
+Rendimiento Mejorado
+
+    Aceleración NAT por Hardware (PPE/FOE): Velocidades de hasta ~930 Mbps en puertos Gigabit sin sobrecargar el procesador.
+
+    CPU de Doble Núcleo Activo (VPE/SMP): Aprovecha al 100% la capacidad del chip, mejorando la multitarea y el tráfico de red.
+
+    Mayor Estabilidad: Optimizaciones en la memoria flash para evitar caídas o reinicios.
+
+Versión con "Menú Fácil" (Kolay Menü)
+
+Para quienes prefieren no complicarse con la interfaz avanzada tradicional de OpenWrt, ofrecemos una versión exclusiva con Menú Fácil, diseñada para configurar todo en segundos y sin conocimientos técnicos:
+
+    Configuración Rápida: Conecta y configura tu conexión a Internet y Wi-Fi en una sola pantalla.
+
+    Servidor WireGuard VPN: Crea tu propia VPN segura con código QR para tu móvil en 2 clics.
+
+    Extensor Wi-Fi / Repetidor: Amplía la señal de tu red principal (soporta WDS, Relayd y Mesh 802.11s) en menos de 30 segundos.
+
+    Wi-Fi de Invitados: Red secundaria aislada al instante.
+
+    Puerto USB Multifunción: Comparte discos duros por red (SMB/FTP) o conecta tu móvil Android/iPhone por cable USB para usar sus datos móviles como respaldo si se corta la fibra.
+
+(Nota: Las funciones del Menú Fácil están disponibles exclusivamente en nuestras unidades preconfiguradas y listas para usar).
+Soporte, Ventas y Consultas
+
+¿Quieres adquirir routers preconfigurados, necesitas soporte para tu proveedor local o buscas compras por volumen para proyectos y empresas?
+
+Escríbenos directamente por correo electrónico:
+
+✉️ emreyavuzalp2@gmail.com
