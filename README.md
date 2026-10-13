@@ -259,10 +259,57 @@ Para quienes prefieren no complicarse con la interfaz avanzada tradicional de Op
     Puerto USB Multifunción: Comparte discos duros por red (SMB/FTP) o conecta tu móvil Android/iPhone por cable USB para usar sus datos móviles como respaldo si se corta la fibra.
 
 (Nota: Las funciones del Menú Fácil están disponibles exclusivamente en nuestras unidades preconfiguradas y listas para usar).
-Soporte, Ventas y Consultas
+
+### Soporte, Ventas y Consultas
 
 ¿Quieres adquirir routers preconfigurados, necesitas soporte para tu proveedor local o buscas compras por volumen para proyectos y empresas?
 
 Escríbenos directamente por correo electrónico:
+
+✉️ emreyavuzalp2@gmail.com
+
+---
+
+### TP-Link Archer C5v — OpenWrt Personalizado (Português)
+
+Este repositório contém o código-fonte base adaptado para o roteador TP-Link
+Archer C5v. Com este firmware você ganha mais estabilidade, alto desempenho
+e controle total sobre a sua rede.
+
+#### Desempenho Aprimorado
+
+* **Aceleração de NAT por Hardware (PPE/FOE):** Velocidades de até
+  ~930 Mbps em portas Gigabit sem sobrecarregar o processador.
+* **CPU de Dois Núcleos Ativo (VPE/SMP):** Aproveita 100% da capacidade do
+  chip, melhorando a multitarefa e o tráfego de rede.
+* **Mais Estabilidade:** Otimizações na memória flash para evitar travamentos
+  ou reinicializações.
+
+#### Versão com "Menu Fácil" (Kolay Menü)
+
+Para quem prefere não lidar com a interface avançada tradicional do OpenWrt,
+oferecemos uma versão exclusiva com Menu Fácil, feita para configurar tudo em
+segundos e sem conhecimento técnico:
+
+* **Configuração Rápida:** Conecte e configure sua conexão de Internet e
+  Wi-Fi em uma única tela.
+* **Servidor WireGuard VPN:** Crie sua própria VPN segura, com código QR
+  para o celular, em 2 cliques.
+* **Extensor de Wi-Fi / Repetidor:** Amplia o sinal da sua rede principal
+  (suporta WDS, Relayd e Mesh 802.11s) em menos de 30 segundos.
+* **Wi-Fi para Visitantes:** Rede secundária isolada, instantaneamente.
+* **Porta USB Multifuncional:** Compartilhe HDs pela rede (SMB/FTP) ou
+  conecte seu celular Android/iPhone via cabo USB para usar os dados móveis
+  como backup caso a fibra caia.
+
+(Nota: Os recursos do Menu Fácil estão disponíveis exclusivamente nas
+unidades que já vendemos pré-configuradas e prontas para uso.)
+
+#### Suporte, Vendas e Dúvidas
+
+Quer adquirir roteadores pré-configurados, precisa de suporte para o seu
+provedor local ou busca compras em volume para projetos e empresas?
+
+Escreva diretamente para o nosso e-mail:
 
 ✉️ emreyavuzalp2@gmail.com
