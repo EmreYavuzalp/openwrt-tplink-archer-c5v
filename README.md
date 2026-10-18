@@ -1,5 +1,18 @@
 # TP-Link Archer C5v — OpenWrt Portu
 
+### Donanım
+
+* **SoC:** EcoNet EN751221, MIPS 34Kc @ 900 MHz, big-endian — stokta tek
+  çekirdek; bu port SoC'nin ikinci donanım çekirdeğini de (VPE/SMP) aktif
+  ediyor, bkz. Öne Çıkan Özellikler
+* **RAM:** 128 MB DDR
+* **Flash:** 128 MB SPI-NAND
+* **Switch:** Harici MT7530 Gigabit switch çipi (VLAN ayrımı destekli)
+* **Wi-Fi:** İki ayrı radyo çipi — 2.4 GHz MT7592N (mt7603e) + 5 GHz MT7612EN
+  (mt76x2e), AC1200 sınıfı
+* **USB:** 1x USB portu (dosya paylaşımı / telefon tethering için Kolay
+  Menü'de kullanılıyor)
+
 ### Sorumluluk Reddi Beyanı
 
 İşbu kaynak kodu, tarafımızca herhangi bir garanti veya taahhüt verilmeksizin,
@@ -31,6 +44,54 @@ WAN portu, kullanılan altyapıya göre farklı bir VLAN ile çalışır:
 * Türkcell Superonline altyapısı: `eth0.2`
 
 Bu, cihazın programlaması gereği böyledir.
+
+**Not: Türk Telekom Tivibu IPTV veya Süperonline TV+ kullanıcılarının
+dikkatine.** Bu servisler IPTV yayınını aynı hat üzerinde ayrı bir VLAN ile
+taşır; set-top-box'ın (STB) bu VLAN'a bağlı bir LAN portuna takılması
+gerekir. Bu depodaki varsayılan DTS'te tüm LAN portları (LAN1-3) normal,
+tek VLAN'lı LAN olarak tanımlıdır — IPTV için ayrı bir port istiyorsanız
+kaynak kodda aşağıdaki değişikliği yapıp **yeniden derlemeniz** gerekir.
+
+**Türk Telekom Tivibu IPTV çok sayıda müşteride test edilmiştir ve
+çalıştığı belgelenmiştir. Süperonline TV+ ile çalışıp çalışmadığı ise
+BELİRSİZDİR** — aşağıdaki VLAN 103 değeri doğrulanmamıştır, kendi
+riskinizle deneyin.
+
+`target/linux/econet/dts/en751221_tplink_archer-c5v.dts` içinde `&ethernet`
+bloğunu bulun:
+
+```dts
+&ethernet {
+	econet,mt7530-vlan-split;
+	econet,mt7530-cpu-port = <6>;
+	econet,mt7530-lan-ports = <0 1 2 3>;
+	econet,mt7530-lan-vid = <1>;
+	econet,mt7530-wan-port = <4>;
+	econet,mt7530-wan-vid = <35>;
+};
+```
+
+`mt7530-lan-ports` listesinden `0`'ı çıkarın (bu, LAN3 portudur) ve iki
+satır ekleyin — Tivibu için VLAN 55, Superonline TV+ için VLAN 103
+(hangi operatördeyseniz sadece O VLAN'ı yazın, ikisi birden değil):
+
+```dts
+&ethernet {
+	econet,mt7530-vlan-split;
+	econet,mt7530-cpu-port = <6>;
+	econet,mt7530-lan-ports = <1 2 3>;
+	econet,mt7530-lan-vid = <1>;
+	econet,mt7530-wan-port = <4>;
+	econet,mt7530-wan-vid = <35>;
+	econet,mt7530-iptv-port = <0>;
+	econet,mt7530-iptv-vid = <55>;   /* Tivibu. Superonline TV+ icin 103 */
+};
+```
+
+Değişiklikten sonra **tam `make` ile yeniden derleyin** — sadece
+`make target/install` paket seçimini rootfs'e işlemez, eksik/minimal bir
+imaj üretebilir (LuCI dahi gelmeyebilir). Yeni imajı flashladıktan sonra
+STB'yi LAN3'e takın.
 
 ### Dikkat ve Sınırlar
 
@@ -94,6 +155,18 @@ Sayfadaki üç yöntem:
 * **Mesh (802.11s):** Yalnızca iki OpenWrt cihazı arasında çalışır, farklı
   marka/cihazla uyumlu değildir.
 
+### Hardware
+
+* **SoC:** EcoNet EN751221, MIPS 34Kc @ 900 MHz, big-endian — single core
+  stock; this port also brings up the SoC's second hardware core (VPE/SMP),
+  see Highlighted Features
+* **RAM:** 128 MB DDR
+* **Flash:** 128 MB SPI-NAND
+* **Switch:** External MT7530 Gigabit switch chip (supports VLAN separation)
+* **Wi-Fi:** Two separate radio chips — 2.4 GHz MT7592N (mt7603e) + 5 GHz
+  MT7612EN (mt76x2e), AC1200 class
+* **USB:** 1x USB port (used by Easy Menu for file sharing / phone tethering)
+
 ### Disclaimer (English)
 
 This source code is provided "as is", without any warranty or commitment of any kind. The user is solely responsible for any malfunction, data loss, or damage resulting from installing or using this software on their device. Restoring the original stock firmware is also entirely at the user's own risk. No free support is provided.
@@ -117,6 +190,54 @@ The WAN port uses a different VLAN depending on the network infrastructure:
 * Türkcell Superonline infrastructure: `eth0.2`
 
 This is determined by the device's firmware programming.
+
+**Note: attention Türk Telekom Tivibu IPTV or Superonline TV+ users.**
+These services carry their IPTV feed over a separate VLAN on the same
+line; the set-top-box (STB) needs to be plugged into a LAN port bound to
+that VLAN. In this repo's default DTS, all LAN ports (LAN1-3) are defined
+as plain, single-VLAN LAN — if you want a dedicated IPTV port, you need
+to make the following change in source and **rebuild**.
+
+**Türk Telekom Tivibu IPTV has been tested on a large number of
+customers and is confirmed to work. Whether it works with Superonline
+TV+ is UNKNOWN** -- the VLAN 103 value below is unverified, try it at
+your own risk.
+
+In `target/linux/econet/dts/en751221_tplink_archer-c5v.dts`, find the
+`&ethernet` block:
+
+```dts
+&ethernet {
+	econet,mt7530-vlan-split;
+	econet,mt7530-cpu-port = <6>;
+	econet,mt7530-lan-ports = <0 1 2 3>;
+	econet,mt7530-lan-vid = <1>;
+	econet,mt7530-wan-port = <4>;
+	econet,mt7530-wan-vid = <35>;
+};
+```
+
+Remove `0` from `mt7530-lan-ports` (this is the LAN3 port) and add two
+lines — VLAN 55 for Tivibu, VLAN 103 for Superonline TV+ (use only the
+one matching your own ISP, not both):
+
+```dts
+&ethernet {
+	econet,mt7530-vlan-split;
+	econet,mt7530-cpu-port = <6>;
+	econet,mt7530-lan-ports = <1 2 3>;
+	econet,mt7530-lan-vid = <1>;
+	econet,mt7530-wan-port = <4>;
+	econet,mt7530-wan-vid = <35>;
+	econet,mt7530-iptv-port = <0>;
+	econet,mt7530-iptv-vid = <55>;   /* Tivibu. Use 103 for Superonline TV+ */
+};
+```
+
+After changing this, **rebuild with a full `make`** -- `make target/install`
+alone does not apply package selection to the rootfs and can produce an
+incomplete/minimal image (LuCI might not even be included). After
+flashing the new image, plug the STB into LAN3.
 
 ### Caution and Limits (English)
 
